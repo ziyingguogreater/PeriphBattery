@@ -40,7 +40,7 @@ from tkinter import ttk
 
 APP_NAME = "外设电量监视"
 APP_ID = "PeriphBatteryTray"
-APP_VERSION = "1.0.2"
+APP_VERSION = "1.0.3"
 AUTOSTART_FLAG = "--autostart"      # 开机自启时带这个参数，用于区分手动/自动
 SUMMARY_MAX_LINES = 4               # 启动通知里最多列几台设备
 
@@ -125,13 +125,14 @@ def load_config() -> dict:
     return cfg
 
 
-def save_config(cfg: dict) -> None:
-    """先写临时文件再替换，写一半失败也不会把原配置毁掉。"""
+def save_config(cfg: dict) -> bool:
+    """先写临时文件再替换，写一半失败也不会把原配置毁掉。返回是否写成功。"""
     tmp = CFG_PATH + ".tmp"
     try:
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(cfg, f, ensure_ascii=False, indent=2)
         os.replace(tmp, CFG_PATH)
+        return True
     except Exception as e:
         log.warning("配置保存失败: %s", e)
         try:
@@ -139,6 +140,7 @@ def save_config(cfg: dict) -> None:
                 os.remove(tmp)
         except Exception:
             pass
+        return False
 
 
 CFG = load_config()
@@ -344,21 +346,26 @@ def _xml_escape(s: str) -> str:
              .replace(">", "&gt;").replace('"', "&quot;"))
 
 
+# 固定脚本：通知内容从 XML 文件读取，绝不拼进脚本源码（避免设备名里带换行/引号时
+# 突破 here-string 边界，把用户可控文本当代码执行）
 TOAST_PS = r'''
+param(
+  [Parameter(Mandatory=$true)][string]$XmlPath,
+  [Parameter(Mandatory=$true)][string]$AppId,
+  [Parameter(Mandatory=$true)][string]$StatusPath
+)
 $ErrorActionPreference = "Stop"
 try {
   [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType=WindowsRuntime] | Out-Null
   [Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType=WindowsRuntime] | Out-Null
-  $xml = @"
-__XML__
-"@
+  $xml = [System.IO.File]::ReadAllText($XmlPath, [System.Text.Encoding]::UTF8)
   $doc = New-Object Windows.Data.Xml.Dom.XmlDocument
   $doc.LoadXml($xml)
   $toast = [Windows.UI.Notifications.ToastNotification]::new($doc)
-  [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier("__AUMID__").Show($toast)
-  "OK" | Out-File -FilePath "__STATUS__" -Encoding utf8
+  [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier($AppId).Show($toast)
+  "OK" | Out-File -FilePath $StatusPath -Encoding utf8
 } catch {
-  ($_.Exception.GetType().FullName + ": " + $_.Exception.Message) | Out-File -FilePath "__STATUS__" -Encoding utf8
+  ($_.Exception.GetType().FullName + ": " + $_.Exception.Message) | Out-File -FilePath $StatusPath -Encoding utf8
 }
 '''
 
@@ -382,7 +389,14 @@ def _cleanup_legacy_toasts() -> None:
             pass
 
 
+def _strip_control(text: str) -> str:
+    """去掉不可见控制字符（保留换行/制表），避免把奇怪字节塞进 XML。"""
+    return "".join(ch for ch in text if ch in "\n\t" or ord(ch) >= 0x20)
+
+
 def show_toast(title: str, msg: str, icon_path: str, silent: bool = False) -> None:
+    title = _strip_control(title or "")
+    msg = _strip_control(msg or "")
     src = "file:///" + icon_path.replace("\\", "/")
     audio_xml = ('<audio silent="true"/>' if silent else
                  '<audio src="ms-winsoundevent:Notification.Looping.Alarm" loop="false"/>')
@@ -398,17 +412,20 @@ def show_toast(title: str, msg: str, icon_path: str, silent: bool = False) -> No
     # 每条通知用独立临时文件：低电量、接入提示、自检可能同时来自不同线程，
     # 共用一个 toast.ps1 会互相覆盖
     uniq = uuid.uuid4().hex[:8]
-    status = os.path.join(data_dir(), "toast_%s.status" % uniq)
-    script = (TOAST_PS.replace("__XML__", xml)
-              .replace("__AUMID__", AUMID)
-              .replace("__STATUS__", status))
-    path = os.path.join(data_dir(), "toast_%s.ps1" % uniq)
+    d = data_dir()
+    xml_path = os.path.join(d, "toast_%s.xml" % uniq)
+    status = os.path.join(d, "toast_%s.status" % uniq)
+    path = os.path.join(d, "toast_%s.ps1" % uniq)
     try:
+        # 脚本是固定的，通知内容走文件参数，不参与任何字符串拼接
+        with open(xml_path, "w", encoding="utf-8") as f:
+            f.write(xml)
         with open(path, "w", encoding="utf-8-sig") as f:
-            f.write(script)
+            f.write(TOAST_PS)
         proc = subprocess.Popen(
             ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass",
-             "-WindowStyle", "Hidden", "-File", path],
+             "-WindowStyle", "Hidden", "-File", path,
+             "-XmlPath", xml_path, "-AppId", AUMID, "-StatusPath", status],
             creationflags=0x08000000,
         )
         log.info("已发起通知: %s", title)
@@ -417,12 +434,12 @@ def show_toast(title: str, msg: str, icon_path: str, silent: bool = False) -> No
         return
 
     def cleanup():
-        # 等 PowerShell 退出再删，避免删掉还在用的脚本
+        # 等 PowerShell 退出再删，避免删掉还在用的文件
         try:
             proc.wait(timeout=20)
         except Exception:
             pass
-        for f in (path, status):
+        for f in (path, xml_path, status):
             try:
                 if os.path.exists(f):
                     os.remove(f)
@@ -1016,7 +1033,12 @@ def load_profile(path: str) -> Profile:
         idx = ai.get("index")
         if not isinstance(idx, int) or isinstance(idx, bool) or not 0 <= idx <= 63:
             raise ValueError("response.alive_if.index 必须是 0~63 的整数")
-        alive_if = (idx, _hex_int(ai.get("value")))
+        val = _hex_int(ai.get("value"))
+        if not 0 <= val <= 255:
+            raise ValueError("response.alive_if.value 必须在 00~FF 之间")
+        if idx >= length:
+            raise ValueError("response.alive_if.index 必须小于 request.length（%d）" % length)
+        alive_if = (idx, val)
     else:
         raise ValueError("response.alive_if 必须是对象")
     try:
@@ -1156,6 +1178,23 @@ class Reading:
     error: str = ""
 
 
+_DEV_LOCKS = {}
+_DEV_LOCKS_GUARD = threading.Lock()
+
+
+def device_io_lock(key: str) -> "threading.RLock":
+    """同一台设备（按 key）共用一把锁。
+
+    设备重建时新旧 BaseDevice 会短暂共存，各自持锁无法防止两者同时读写
+    同一个物理接口，所以锁按 key 共享，直到进程结束。"""
+    with _DEV_LOCKS_GUARD:
+        lock = _DEV_LOCKS.get(key)
+        if lock is None:
+            lock = threading.RLock()
+            _DEV_LOCKS[key] = lock
+        return lock
+
+
 class BaseDevice:
     payload_len = 64
     report_size = 65
@@ -1169,8 +1208,9 @@ class BaseDevice:
         self.fail = 0
         self.last_product = info.product or info.key
         # 同一个设备的请求/回包必须串行：后台轮询线程和「运行自检」
-        # 会同时读同一台设备，交叉发送会让回包被错误的调用消费
-        self._io_lock = threading.RLock()
+        # 会同时读同一台设备，交叉发送会让回包被错误的调用消费。
+        # 用按 key 共享的锁，重建后的新对象也会和旧对象互斥。
+        self._io_lock = device_io_lock(info.key)
 
     # --- 基本信息 ---
     @property
@@ -1211,12 +1251,13 @@ class BaseDevice:
         return False
 
     def close(self):
-        if self.dev is not None:
-            try:
-                self.dev.close()
-            except Exception:
-                pass
-        self.dev = None
+        with self._io_lock:      # 与读写互斥，别把别人正在用的句柄关掉
+            if self.dev is not None:
+                try:
+                    self.dev.close()
+                except Exception:
+                    pass
+            self.dev = None
 
     # --- 通信 ---
     def _write(self, payload: bytes):
@@ -1227,6 +1268,7 @@ class BaseDevice:
         while time.time() < deadline:
             data = self.dev.read(self.report_size, 60)
             if not data:
+                time.sleep(0.005)   # 万一某个绑定立即返回空，也别空转烧 CPU
                 continue
             if match(data):
                 return data
@@ -2094,7 +2136,12 @@ class SettingsDialog:
             item = settings.setdefault(key, {"enabled": True, "mode": "auto"})
             item["enabled"] = bool(v.get())
 
-        save_config(cfg)
+        if not save_config(cfg):
+            # 程序目录不可写（例如放在 Program Files）：明确告诉用户，别让它静默失败
+            show_error_dialog(
+                self.win,
+                "设置保存失败：程序目录可能没有写入权限。\n"
+                "请把程序放到用户目录或桌面后重试。")
         self.app.on_config_changed()
         log.info("设置已保存: 阈值=%s%% 间隔=%ss 设备=%d 项",
                  cfg["low_threshold"], cfg["interval_sec"], len(settings))
