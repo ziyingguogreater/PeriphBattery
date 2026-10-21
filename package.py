@@ -10,6 +10,13 @@ import os
 import sys
 import zipfile
 
+# CI（英文 Windows）控制台默认不是 UTF-8，直接 print 中文会抛 UnicodeEncodeError
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+
 ROOT = os.path.dirname(os.path.abspath(__file__))
 DIST = os.path.join(ROOT, "dist")
 INNER = "外设电量监视"          # 压缩包内的文件夹名
@@ -46,6 +53,8 @@ def main() -> int:
         print("缺少文件，先执行打包：")
         for m in missing:
             print("  -", os.path.relpath(m, ROOT))
+        for d in ("dist", "device"):
+            print("[目录] %s: %s" % (d, sorted(os.listdir(os.path.join(ROOT, d)))))
         return 1
 
     if os.path.exists(out):
