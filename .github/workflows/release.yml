@@ -40,6 +40,7 @@ jobs:
       - name: 发布 Release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ github.ref_name }}   # 明确绑定当前标签，避免挂到别的 Release
           files: PeriphBattery-portable.zip
           generate_release_notes: true
           body: |
