@@ -36,7 +36,8 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name }}   # 明确绑定当前标签，避免挂到别的 Release
-          files: PeriphBattery-portable.zip
+          files: dist/PeriphBattery-portable.zip   # package.py 输出在 dist 下
+          fail_on_unmatched_files: true
           generate_release_notes: true
           body: |
             便携包解压即用，无需安装。
