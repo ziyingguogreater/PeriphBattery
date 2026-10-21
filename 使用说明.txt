@@ -123,6 +123,8 @@
   退出
 
 【配置文件 config.json】
+  注意：config.json 与 device 文件夹都在程序所在目录，程序需要对目录有写权限。
+  放进 C://Program Files 这类受保护目录会存不住配置，请放在用户目录或桌面。
   interval_sec        检查间隔（秒）
   low_threshold       低电量阈值（%）
   custom_threshold    自定义阈值（0 表示没有；与预设重复时也会归 0）

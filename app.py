@@ -370,6 +370,17 @@ def set_app_logo(path: str) -> None:
     APP_LOGO = path
 
 
+def _cleanup_legacy_toasts() -> None:
+    """删掉旧版本共用固定文件名留下的 toast.ps1 / toast_status.txt。"""
+    for name in ("toast.ps1", "toast_status.txt"):
+        p = os.path.join(data_dir(), name)
+        try:
+            if os.path.exists(p):
+                os.remove(p)
+        except Exception:
+            pass
+
+
 def show_toast(title: str, msg: str, icon_path: str, silent: bool = False) -> None:
     src = "file:///" + icon_path.replace("\\", "/")
     audio_xml = ('<audio silent="true"/>' if silent else
@@ -383,27 +394,41 @@ def show_toast(title: str, msg: str, icon_path: str, silent: bool = False) -> No
         '</toast>' % ("short" if silent else "long",
                       _xml_escape(title), _xml_escape(msg), src, audio_xml)
     )
-    status = os.path.join(data_dir(), "toast_status.txt")
-    try:
-        if os.path.exists(status):
-            os.remove(status)
-    except Exception:
-        pass
+    # 每条通知用独立临时文件：低电量、接入提示、自检可能同时来自不同线程，
+    # 共用一个 toast.ps1 会互相覆盖
+    uniq = uuid.uuid4().hex[:8]
+    status = os.path.join(data_dir(), "toast_%s.status" % uniq)
     script = (TOAST_PS.replace("__XML__", xml)
               .replace("__AUMID__", AUMID)
               .replace("__STATUS__", status))
-    path = os.path.join(data_dir(), "toast.ps1")
-    with open(path, "w", encoding="utf-8-sig") as f:
-        f.write(script)
+    path = os.path.join(data_dir(), "toast_%s.ps1" % uniq)
     try:
-        subprocess.Popen(
+        with open(path, "w", encoding="utf-8-sig") as f:
+            f.write(script)
+        proc = subprocess.Popen(
             ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass",
              "-WindowStyle", "Hidden", "-File", path],
             creationflags=0x08000000,
         )
-        log.info("通知已发送: %s", title)
+        log.info("已发起通知: %s", title)
     except Exception as e:
         log.warning("通知发送失败: %s", e)
+        return
+
+    def cleanup():
+        # 等 PowerShell 退出再删，避免删掉还在用的脚本
+        try:
+            proc.wait(timeout=20)
+        except Exception:
+            pass
+        for f in (path, status):
+            try:
+                if os.path.exists(f):
+                    os.remove(f)
+            except Exception:
+                pass
+
+    threading.Thread(target=cleanup, daemon=True).start()
 
 
 def diagnose_notifications():
@@ -562,7 +587,8 @@ def system_dpi() -> int:
 BT_BATT_KEY = "{104EA319-6EE2-4701-BD47-8DDBF425BBE5} 2"
 BT_TTL = 4.0                  # 缓存多久重新查一次（查询只要几毫秒，查勤一点）
 _BT_CACHE = {"ts": 0.0, "items": [], "busy": False}
-_BT_LOCK = threading.Lock()
+_BT_LOCK = threading.Lock()          # 只保护 busy 标志
+_BT_REFRESH = threading.Lock()       # 保证同一时刻只有一次系统查询
 
 # 设备属性键：{104EA319-…} 2 = 电量百分比（Byte），DEVPKEY_NAME = 名称
 _PROP_BATTERY = ("104EA319-6EE2-4701-BD47-8DDBF425BBE5", 2)
@@ -593,10 +619,37 @@ _cfgmgr = None
 
 
 def _cfg():
-    """懒加载 cfgmgr32，避免没用到蓝牙时也去碰系统库。"""
+    """懒加载 cfgmgr32，避免没用到蓝牙时也去碰系统库。
+
+    显式声明参数/返回类型：虽然 ctypes 默认会把 str 转成 wchar_t*，
+    但把类型写清楚能避免以后换 Python 版本或 64 位指针截断时踩坑。"""
     global _cfgmgr, _BT_PROP_BATTERY, _BT_PROP_NAME
     if _cfgmgr is None:
-        _cfgmgr = ctypes.WinDLL("cfgmgr32")
+        from ctypes import wintypes
+        cm = ctypes.WinDLL("cfgmgr32")
+        ULONG = wintypes.ULONG
+        LPCWSTR = ctypes.c_wchar_p
+        LPWSTR = ctypes.c_wchar_p
+        PULONG = ctypes.POINTER(ULONG)
+        FAILED = 0
+
+        def sig(name, argtypes):
+            fn = getattr(cm, name)
+            fn.argtypes = argtypes
+            fn.restype = ULONG
+            return fn
+
+        sig("CM_Get_Device_ID_List_SizeW", [PULONG, LPCWSTR, ULONG])
+        sig("CM_Get_Device_ID_ListW", [LPCWSTR, LPWSTR, ULONG, ULONG])
+        sig("CM_Locate_DevNodeW", [PULONG, LPCWSTR, ULONG])
+        sig("CM_Get_Device_IDW", [ULONG, LPWSTR, ULONG, ULONG])
+        sig("CM_Get_Child", [PULONG, ULONG, ULONG])
+        sig("CM_Get_Sibling", [PULONG, ULONG, ULONG])
+        sig("CM_Get_DevNode_Status", [PULONG, PULONG, ULONG, ULONG])
+        sig("CM_Get_DevNode_PropertyW",
+            [ULONG, ctypes.POINTER(_DEVPROPKEY), PULONG,
+             ctypes.c_void_p, PULONG, ULONG])
+        _cfgmgr = cm
         _BT_PROP_BATTERY = _propkey(*_PROP_BATTERY)
         _BT_PROP_NAME = _propkey(*_PROP_NAME)
     return _cfgmgr
@@ -635,7 +688,8 @@ def _devnode_prop(devinst, key):
         return None, b""
     buf = (ctypes.c_ubyte * size.value)()
     if cm.CM_Get_DevNode_PropertyW(devinst, ctypes.byref(key),
-                                   ctypes.byref(ptype), buf,
+                                   ctypes.byref(ptype),
+                                   ctypes.cast(buf, ctypes.c_void_p),
                                    ctypes.byref(size), 0) != 0:
         return None, b""
     return ptype.value, bytes(buf[:size.value])
@@ -734,6 +788,18 @@ def _bt_refresh():
             "%s %d%%" % (i["name"], i["level"]) for i in items))
 
 
+def _bt_refresh_once(wait: float = 0.0) -> bool:
+    """串行化查询：拿到锁才真的去查，避免两个线程同时刷写缓存。"""
+    got = _BT_REFRESH.acquire(True, wait) if wait else _BT_REFRESH.acquire(False)
+    if not got:
+        return False
+    try:
+        _bt_refresh()
+    finally:
+        _BT_REFRESH.release()
+    return True
+
+
 def _kick_bt_refresh():
     with _BT_LOCK:
         if _BT_CACHE["busy"]:
@@ -742,7 +808,7 @@ def _kick_bt_refresh():
 
     def work():
         try:
-            _bt_refresh()
+            _bt_refresh_once()
         except Exception:
             log.debug("蓝牙电量刷新线程异常", exc_info=True)
         finally:
@@ -755,14 +821,10 @@ def _kick_bt_refresh():
 def bt_snapshot(blocking: bool = True) -> list:
     """当前蓝牙输入设备电量；blocking=False 时只在后台刷新，不卡界面。"""
     now = time.time()
-    first = (_BT_CACHE["ts"] == 0.0)
-    if first or now - _BT_CACHE["ts"] > BT_TTL:
+    stale = _BT_CACHE["ts"] == 0.0 or now - _BT_CACHE["ts"] > BT_TTL
+    if stale:
         if blocking:
-            if _BT_LOCK.acquire(blocking=False):
-                try:
-                    _bt_refresh()
-                finally:
-                    _BT_LOCK.release()
+            _bt_refresh_once(wait=0.5)     # 别的线程正在查就等它一下
         else:
             _kick_bt_refresh()
     return _BT_CACHE["items"]
@@ -884,8 +946,14 @@ def load_profile(path: str) -> Profile:
         pids = tuple(_hex_int(x) for x in pids)
     else:
         raise ValueError("match.pid 必须是数字、字符串或数组")
+    if any(not 0 <= x <= 0xFFFF for x in pids):
+        raise ValueError("match.pid 必须在 0~FFFF 之间")
     usage_page = _hex_int(_need(m, "usage_page", "match."))
     usage = _hex_int(_need(m, "usage", "match."))
+    if not 0 <= usage_page <= 0xFFFF:
+        raise ValueError("match.usage_page 必须在 0~FFFF 之间")
+    if not 0 <= usage <= 0xFFFF:
+        raise ValueError("match.usage 必须在 0~FFFF 之间")
 
     rq = _need(raw, "request", "")
     if not isinstance(rq, dict):
@@ -908,12 +976,16 @@ def load_profile(path: str) -> Profile:
     expect = _hex_bytes(exp) if exp else b""
     level_index = _hex_int(_need(rs, "level_index", "response."))
     charge_index = _hex_int(_need(rs, "charge_index", "response."))
-    if not 0 <= level_index < 256 or not 0 <= charge_index < 256:
-        raise ValueError("response 的索引超出范围")
+    if len(expect) > length:
+        raise ValueError("response.expect 比回包长度还长")
+    if not 0 <= level_index < length or not 0 <= charge_index < length:
+        raise ValueError("response 的索引必须小于 request.length（%d）" % length)
     charge_on = rs.get("charge_on", [1])
     if (not isinstance(charge_on, list) or not charge_on
             or not all(isinstance(x, int) and not isinstance(x, bool) for x in charge_on)):
         raise ValueError("response.charge_on 必须是非空整数数组")
+    if any(not 0 <= x <= 255 for x in charge_on):
+        raise ValueError("response.charge_on 的取值必须在 0~255 之间")
     wired_if = rs.get("wired_if", {})
     if not isinstance(wired_if, dict):
         raise ValueError("response.wired_if 必须是对象")
@@ -922,6 +994,9 @@ def load_profile(path: str) -> Profile:
             raise ValueError("response.wired_if 只能写 level / charge")
         if not isinstance(v, int) or isinstance(v, bool):
             raise ValueError("response.wired_if.%s 必须是整数" % k)
+        hi = 100 if k == "level" else 255
+        if not 0 <= v <= hi:
+            raise ValueError("response.wired_if.%s 必须在 0~%d 之间" % (k, hi))
     wp = rs.get("wired_pids")
     if wp is None:
         wired_pids = ()
@@ -929,6 +1004,8 @@ def load_profile(path: str) -> Profile:
         if not wp:
             raise ValueError("response.wired_pids 不能是空数组")
         wired_pids = tuple(_hex_int(x) for x in wp)
+        if any(not 0 <= x <= 0xFFFF for x in wired_pids):
+            raise ValueError("response.wired_pids 必须在 0~FFFF 之间")
     else:
         raise ValueError("response.wired_pids 必须是数组")
     ai = rs.get("alive_if")
@@ -1090,6 +1167,9 @@ class BaseDevice:
         self._evt = None
         self.fail = 0
         self.last_product = info.product or info.key
+        # 同一个设备的请求/回包必须串行：后台轮询线程和「运行自检」
+        # 会同时读同一台设备，交叉发送会让回包被错误的调用消费
+        self._io_lock = threading.RLock()
 
     # --- 基本信息 ---
     @property
@@ -1155,7 +1235,8 @@ class BaseDevice:
         raise NotImplementedError
 
     def poll_forced(self) -> Reading:
-        rd = self.poll()
+        with self._io_lock:         # 与自检等其它调用方互斥
+            rd = self.poll()
         if rd.connected:
             if self.force_mode == "wired":
                 rd.wired = True
@@ -2321,6 +2402,7 @@ class App:
         self._flash_until = 0.0      # 自检后短时闪烁的结束时间
         self._need_menu_refresh = False   # 阈值变化后重建托盘菜单
         self.mute_alerts = False     # 临时停用低电量通知（只在本次运行有效）
+        self._loop_err_ts = 0.0      # 主循环异常日志的限频时间戳
         self.notify_ok = True        # 通知权限是否可用（启动时读注册表）
         self.notify_notes = []
         self._last_notify_check = 0.0
@@ -2338,6 +2420,7 @@ class App:
             bt_snapshot(blocking=True)   # 预热蓝牙电量（毫秒级），启动提示才不漏设备
         except Exception as e:
             log.warning("蓝牙设备预热失败: %s", e)
+        _cleanup_legacy_toasts()
 
         self.alert_png = save_png(icon_alarm(TOAST_ICON), "alert.png")
         self.connect_png = save_png(icon_connected(TOAST_ICON), "connected.png")
@@ -2360,7 +2443,6 @@ class App:
                 dev.retired = True
                 if dev._evt:
                     dev._evt.set()
-                dev.close()
             self._devices = []
             with self.lock:
                 self.readings.clear()
@@ -2423,12 +2505,12 @@ class App:
             if st.get("enabled", True):
                 wanted[info.key] = (info, st.get("mode", "auto"))
 
-        for dev in self._devices:
+        for dev in list(self._devices):
             if dev.key not in wanted:
                 dev.retired = True
                 if dev._evt:
                     dev._evt.set()
-                dev.close()
+                # 句柄交给工作线程退出时自己关，避免在读写中途被关掉
 
         keep = [d for d in self._devices if not d.retired]
         existing = {d.key: d for d in keep}
@@ -2442,7 +2524,6 @@ class App:
                 dev.retired = True
                 if dev._evt:
                     dev._evt.set()
-                dev.close()
                 keep.remove(dev)
                 log.info("[%s] 连接方式改为 %s，重建监视", dev.name(), mode)
             dev = make_device(info, mode)
@@ -2513,6 +2594,8 @@ class App:
             evt.wait(interval if rd.connected else min(interval, 5))
             evt.clear()
 
+        # 句柄由这里关：此时本线程不再读它，不会和别的线程抢同一个设备
+        dev.close()
         log.info("[%s] 轮询线程退出", dev.name())
 
     def refresh_now(self):
@@ -2810,7 +2893,11 @@ class App:
                             log.warning("通知权限: 不可用（%s）", "；".join(notes))
                     self.apply(force=True)
             except Exception:
-                pass
+                # 别把异常吞掉：限频记录，避免某个异常每 0.8 秒刷满日志
+                now = time.time()
+                if now - self._loop_err_ts > 60:
+                    self._loop_err_ts = now
+                    log.exception("主循环异常（60 秒内同类只记一次）")
             time.sleep(0.8)
 
     # --- 菜单动作 ---
@@ -3010,8 +3097,7 @@ class App:
         self.stop_evt.set()
         for d in list(self._devices):
             if d._evt:
-                d._evt.set()
-            d.close()
+                d._evt.set()       # 工作线程醒来后会自己 close
         if self.root is not None:
             try:
                 self.root.after(0, self.root.destroy)
