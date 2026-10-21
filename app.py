@@ -2313,7 +2313,7 @@ class App:
         self._need_rescan = False    # 由 worker 置位，ui_loop 统一执行重建
         self._last_scan = 0.0        # 上次枚举设备表的时间
         self._last_title_sync = 0.0  # 上次写 tooltip 文本的时间
-        self._rebuild_lock = threading.Lock()
+        self._rebuild_lock = threading.RLock()
         self.autostart = AUTOSTART_FLAG in sys.argv   # 由开机自启拉起
         self._flash_until = 0.0      # 自检后短时闪烁的结束时间
         self._need_menu_refresh = False   # 阈值变化后重建托盘菜单
@@ -2351,22 +2351,23 @@ class App:
 
     def reload_devices(self):
         """重新读取 device 目录并重建设备表，返回这次新增的设备。"""
-        old_keys = {d.key for d in self._devices}
-        for dev in self._devices:
-            dev.retired = True
-            if dev._evt:
-                dev._evt.set()
-            dev.close()
-        self._devices = []
-        with self.lock:
-            self.readings.clear()
-        reload_profiles()
-        self.rebuild_devices(rescan=True)
-        new = [d for d in self._devices if d.key not in old_keys]
-        self.apply(force=True)
-        if new:
-            log.info("发现新增设备: %s", "、".join(d.name() for d in new))
-        return new
+        with self._rebuild_lock:        # 与后台重建互斥，避免两边同时动设备表
+            old_keys = {d.key for d in self._devices}
+            for dev in list(self._devices):
+                dev.retired = True
+                if dev._evt:
+                    dev._evt.set()
+                dev.close()
+            self._devices = []
+            with self.lock:
+                self.readings.clear()
+            reload_profiles()
+            self.rebuild_devices(rescan=True)
+            new = [d for d in self._devices if d.key not in old_keys]
+            self.apply(force=True)
+            if new:
+                log.info("发现新增设备: %s", "、".join(d.name() for d in new))
+            return new
 
     def notify_added(self, devs):
         """有新设备接入监视时提示一次，内容格式与启动提示一致。"""
@@ -2427,10 +2428,20 @@ class App:
                 dev.close()
 
         keep = [d for d in self._devices if not d.retired]
-        existing = {d.key for d in keep}
+        existing = {d.key: d for d in keep}
         for key, (info, mode) in wanted.items():
-            if key in existing:
-                continue
+            dev = existing.get(key)
+            if dev is not None:
+                if dev.force_mode == mode:
+                    continue
+                # 连接方式（auto/wired/wireless）只在构造时生效，
+                # 配置改了必须重建，否则旧对象还按老方式解析
+                dev.retired = True
+                if dev._evt:
+                    dev._evt.set()
+                dev.close()
+                keep.remove(dev)
+                log.info("[%s] 连接方式改为 %s，重建监视", dev.name(), mode)
             dev = make_device(info, mode)
             keep.append(dev)
             self._start_worker(dev)
@@ -2494,6 +2505,8 @@ class App:
             self._maybe_alert(dev, rd)
 
             interval = self.cfg.get("interval_sec", 60)
+            # 先等再清：等的时候被 set（立即刷新）会马上返回，随后照旧
+            # 走下一轮 poll，所以这里 clear 不会吞掉刷新请求
             evt.wait(interval if rd.connected else min(interval, 5))
             evt.clear()
 
@@ -2503,7 +2516,7 @@ class App:
         if not self._devices:       # 没有在监视的设备，刷新没有意义
             return
         self.refresh_until = time.time() + 2.0
-        for d in self._devices:
+        for d in list(self._devices):
             if d._evt:
                 d._evt.set()
         self.apply(force=True)
@@ -2566,7 +2579,7 @@ class App:
                 now = time.time()
                 rs = self.snapshot()
                 threshold = int(self.cfg.get("low_threshold", 20))
-                for d in self._devices:
+                for d in list(self._devices):
                     r = rs.get(d.key)
                     if (r and r.connected and not r.wired
                             and r.level is not None and r.level <= threshold):
@@ -2646,7 +2659,7 @@ class App:
     def compute(self):
         rs = self.snapshot()
         items = []
-        for d in self._devices:
+        for d in list(self._devices):
             r = rs.get(d.key)
             if r:
                 items.append((d, r))
@@ -2678,7 +2691,7 @@ class App:
             img = app_icon_image(sz, 0.45, badged) or icon_offline(sz)
 
         lines = []
-        for d in self._devices:
+        for d in list(self._devices):
             r = rs.get(d.key)
             nm = d.name()
             if r is None:
@@ -2947,7 +2960,7 @@ class App:
             self.apply(force=True)
 
             lines = []
-            for d in self._devices:
+            for d in list(self._devices):
                 try:
                     rd = d.poll_forced()
                 except Exception as e:
@@ -2991,7 +3004,7 @@ class App:
 
     def quit(self, icon=None, item=None):
         self.stop_evt.set()
-        for d in self._devices:
+        for d in list(self._devices):
             if d._evt:
                 d._evt.set()
             d.close()
