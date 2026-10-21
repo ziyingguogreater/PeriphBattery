@@ -615,7 +615,10 @@ def _devnode_ids(enumerator: str) -> list:
     buf = ctypes.create_unicode_buffer(size.value)
     if cm.CM_Get_Device_ID_ListW(enumerator, buf, size.value, flags) != 0:
         return []
-    return [s for s in ctypes.wstring_at(buf, size.value).split("\x00") if s]
+    # size.value 是整个多字符串缓冲的「字符数」（含各个 \x00 和结尾双 nul），
+    # 所以按字符数取整段再用 \x00 切成多个实例 ID 是对的
+    raw = ctypes.wstring_at(buf, size.value)
+    return [s for s in raw.split("\x00") if s]
 
 
 def _devnode_prop(devinst, key):
@@ -2561,7 +2564,8 @@ class App:
             else:
                 lines.append("%s · 已连接" % d.name())
         if len(items) > SUMMARY_MAX_LINES:
-            lines.append("等 %d 个设备" % len(items))
+            # 这里 items 是全部设备，不是"剩下的"，所以用"共"而不是"等"
+            lines.append("共 %d 台设备" % len(items))
         return lines, len(items)
 
     def _startup_notify(self):
