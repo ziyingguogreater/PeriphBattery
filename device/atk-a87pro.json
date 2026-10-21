@@ -1,0 +1,26 @@
+{
+  "name": "ATK A87Pro",
+  "kind": "keyboard",
+  "match": {
+    "vid": "373B",
+    "usage_page": "FF60",
+    "usage": "61"
+  },
+  "request": {
+    "payload": "02 96 24",
+    "length": 32
+  },
+  "response": {
+    "expect": "02 96 24",
+    "level_index": 3,
+    "charge_index": 4,
+    "timeout": 1.0,
+    "wired_if": {
+      "level": 0,
+      "charge": 0
+    },
+    "wired_pids": [
+      "111E"
+    ]
+  }
+}

@@ -1,0 +1,22 @@
+{
+  "name": "MCHOSE G3 V2",
+  "kind": "mouse",
+  "match": {
+    "vid": "3837",
+    "usage_page": "FF01",
+    "usage": "10"
+  },
+  "request": {
+    "payload": "55 30 A5 0B 2E 01 01 01",
+    "length": 64
+  },
+  "response": {
+    "expect": "AA 30",
+    "level_index": 8,
+    "charge_index": 9,
+    "alive_if": {
+      "index": 3,
+      "value": "0B"
+    }
+  }
+}

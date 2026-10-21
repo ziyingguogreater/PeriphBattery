@@ -1,0 +1,96 @@
+# 外设电量监视（PeriphBattery）
+
+Windows 托盘小工具：常驻后台读取鼠标 / 键盘的剩余电量，托盘图标用数字直接显示，
+低电量自动提醒。支持 USB 有线、2.4G 接收器和蓝牙三种连接方式。
+
+## 功能
+
+- **托盘显示电量**：图标上直接画百分比，鼠标悬停看完整列表（名称、VID:PID、类型、状态）
+- **多设备同时监视**：同型号插两台也能分开显示与设置
+- **三种连接方式**
+  - USB 有线：从设备厂商 HID 接口读电，纯供电时显示「USB 供电」
+  - 2.4G 接收器：可识别接收器在、设备已关机的情况（靠回包里的链路标志位）
+  - 蓝牙：直接从系统设备属性取电量，**不需要配置文件**，设备断开会自动移出列表
+- **低电量提醒**：阈值可设（预设 10%~50% + 自定义 1~99），低于阈值发系统通知 + 图标闪烁
+- **临时停用通知**：右键菜单一键静音，图标照旧闪烁，重启自动恢复
+- **配置文件化管理**：`device/*.json` 描述「发什么、怎么解析」，可自己添加新设备
+- **单实例运行**、DPI 适配、深色界面、通知权限检测
+
+## 使用
+
+### 直接使用（推荐）
+
+到 [Releases](../../releases) 下载 `PeriphBattery-便携版.zip`，解压后双击 `PeriphBattery.exe`。
+没有依赖、不用安装，放在任意目录都行。
+
+> 首次启动如果收不到通知，点托盘图标按提示打开「通知和操作」里的开关。
+
+### 从源码运行
+
+```bash
+python -m venv .venv
+.venv\Scripts\activate
+pip install -r requirements.txt
+python app.py
+```
+
+### 打包
+
+```bash
+pip install pyinstaller
+pyinstaller --noconfirm PeriphBattery.spec
+```
+
+或者直接双击 `build.bat`，产物在 `dist\PeriphBattery.exe`。
+
+## 设备配置
+
+`device/` 目录下每个 json 描述一种设备：
+
+```json
+{
+  "name": "MCHOSE G3 V2",
+  "kind": "mouse",
+  "match": { "vid": "3837", "usage_page": "FF01", "usage": "10" },
+  "request": { "payload": "55 30 A5 0B 2E 01 01 01", "length": 64 },
+  "response": {
+    "expect": "AA 30",
+    "level_index": 8,
+    "charge_index": 9,
+    "alive_if": { "index": 3, "value": "0B" }
+  }
+}
+```
+
+- `match`：按 VID / PID / 用法页 / 用途匹配 HID 接口
+- `request.payload`：发的原始报文（十六进制）
+- `level_index` / `charge_index`：回包里电量与充电状态的位置
+- 可选：`wired_if`（哪种回包代表纯供电）、`wired_pids`（只有这些 PID 才算纯供电）、
+  `alive_if`（哪个字节等于什么值才算设备在线，用于识别「接收器在、设备关机」）
+
+字段细节、界面操作、常见问题见 [使用说明.txt](使用说明.txt)。
+
+## 目录结构
+
+```
+app.py                 主程序（托盘、设置、设备读取、通知）
+device/*.json          设备配置文件
+assets/                图标资源
+使用说明.txt            完整中文说明
+PeriphBattery.spec     PyInstaller 打包配置
+build.bat              一键打包脚本
+```
+
+## 已知限制
+
+- 只支持 Windows（用到 Win32 / WMI / 系统通知）
+- 蓝牙设备读的是系统上报的电量，个别设备在系统里本来就不显示电量，程序也读不到
+- 2.4G 接收器在设备关机后会重播缓存回包，需要配置里写对 `alive_if` 才能识别（本仓库自带的两个配置已处理）
+
+## 更新日志
+
+### v1.0.0
+
+- 首个发布版本：托盘电量显示、多设备、低电量阈值与提醒、配置文件管理
+- 支持 USB / 2.4G / 蓝牙三种连接方式
+- 蓝牙设备断线自动移出，2.4G 设备关机可识别
