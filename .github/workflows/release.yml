@@ -27,15 +27,7 @@ jobs:
         run: pyinstaller --noconfirm PeriphBattery.spec
 
       - name: 组装便携包
-        shell: pwsh
-        run: |
-          $dst = "pkg\外设电量监视"
-          New-Item -ItemType Directory -Force -Path $dst | Out-Null
-          Copy-Item dist\PeriphBattery.exe $dst
-          Copy-Item 使用说明.txt $dst
-          Copy-Item device $dst -Recurse -Force
-          # Release 资产名会被 GitHub 清洗成 ASCII，这里直接用英文名避免变成 PeriphBattery-.zip
-          Compress-Archive -Path $dst -DestinationPath "PeriphBattery-portable.zip" -Force
+        run: python package.py PeriphBattery-portable.zip
 
       - name: 发布 Release
         uses: softprops/action-gh-release@v2

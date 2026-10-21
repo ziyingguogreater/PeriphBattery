@@ -40,7 +40,7 @@ from tkinter import ttk
 
 APP_NAME = "外设电量监视"
 APP_ID = "PeriphBatteryTray"
-APP_VERSION = "1.0.1"
+APP_VERSION = "1.0.2"
 AUTOSTART_FLAG = "--autostart"      # 开机自启时带这个参数，用于区分手动/自动
 SUMMARY_MAX_LINES = 4               # 启动通知里最多列几台设备
 
