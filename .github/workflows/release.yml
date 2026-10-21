@@ -34,12 +34,13 @@ jobs:
           Copy-Item dist\PeriphBattery.exe $dst
           Copy-Item 使用说明.txt $dst
           Copy-Item device $dst -Recurse -Force
-          Compress-Archive -Path $dst -DestinationPath "PeriphBattery-便携版.zip" -Force
+          # Release 资产名会被 GitHub 清洗成 ASCII，这里直接用英文名避免变成 PeriphBattery-.zip
+          Compress-Archive -Path $dst -DestinationPath "PeriphBattery-portable.zip" -Force
 
       - name: 发布 Release
         uses: softprops/action-gh-release@v2
         with:
-          files: PeriphBattery-便携版.zip
+          files: PeriphBattery-portable.zip
           generate_release_notes: true
           body: |
             便携包解压即用，无需安装。
