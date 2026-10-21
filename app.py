@@ -2912,21 +2912,25 @@ class App:
         def make(v):
             return lambda icon, item: self.set_threshold(v)
 
-        now = int(self.cfg.get("low_threshold", 20))
-        custom = int(self.cfg.get("custom_threshold", 0) or 0)
-        items = [
-            MenuItem("%d%%" % v, make(v),
-                     checked=(lambda i, v=v: int(self.cfg.get("low_threshold", 20)) == v),
-                     radio=True)
-            for v in PRESET_THRESHOLDS
-        ]
-        if 0 < custom <= 99 and custom not in PRESET_THRESHOLDS:
-            # 自定义阈值只有在设置界面保存过之后才出现
-            items.append(MenuItem("%d%%（自定义）" % custom, make(custom),
-                                  checked=(lambda i, v=custom:
-                                           int(self.cfg.get("low_threshold", 20)) == v),
-                                  radio=True))
-        return Menu(*items)
+        # 用「可调用菜单」而不是固定列表：pystray 的 update_menu() 只重建
+        # HMENU，静态列表不会重新求值，运行中新加的自定义阈值就不会出现。
+        # 传生成器给 Menu，每次重建菜单时才会重新算一遍条目。
+        def gen():
+            for v in PRESET_THRESHOLDS:
+                yield MenuItem(
+                    "%d%%" % v, make(v),
+                    checked=(lambda i, v=v: int(self.cfg.get("low_threshold", 20)) == v),
+                    radio=True)
+            custom = int(self.cfg.get("custom_threshold", 0) or 0)
+            if 0 < custom <= 99 and custom not in PRESET_THRESHOLDS:
+                # 自定义阈值只有在设置界面保存过之后才出现
+                yield MenuItem(
+                    "%d%%（自定义）" % custom, make(custom),
+                    checked=(lambda i, v=custom:
+                             int(self.cfg.get("low_threshold", 20)) == v),
+                    radio=True)
+
+        return Menu(gen)
 
     def toggle_autostart(self, icon=None, item=None):
         self.cfg["start_with_windows"] = not self.cfg.get("start_with_windows", False)
