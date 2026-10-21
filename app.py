@@ -40,6 +40,7 @@ from tkinter import ttk
 
 APP_NAME = "外设电量监视"
 APP_ID = "PeriphBatteryTray"
+APP_VERSION = "1.0.1"
 AUTOSTART_FLAG = "--autostart"      # 开机自启时带这个参数，用于区分手动/自动
 SUMMARY_MAX_LINES = 4               # 启动通知里最多列几台设备
 
@@ -3129,7 +3130,7 @@ class App:
         # 等第一轮读数回来再汇报
         self.root.after(3500, self._startup_notify)
 
-        log.info("==== 启动 ==== (autostart=%s)", self.autostart)
+        log.info("==== 启动 v%s ==== (autostart=%s)", APP_VERSION, self.autostart)
         self.root.mainloop()
 
     def _tray_thread(self):
