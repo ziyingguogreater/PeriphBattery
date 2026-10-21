@@ -1,0 +1,47 @@
+name: build-release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+
+      - name: 打包 exe
+        run: pyinstaller --noconfirm PeriphBattery.spec
+
+      - name: 组装便携包
+        shell: pwsh
+        run: |
+          $dst = "pkg\外设电量监视"
+          New-Item -ItemType Directory -Force -Path $dst | Out-Null
+          Copy-Item dist\PeriphBattery.exe $dst
+          Copy-Item 使用说明.txt $dst
+          Copy-Item device $dst -Recurse -Force
+          Compress-Archive -Path $dst -DestinationPath "PeriphBattery-便携版.zip" -Force
+
+      - name: 发布 Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: PeriphBattery-便携版.zip
+          generate_release_notes: true
+          body: |
+            便携包解压即用，无需安装。
+
+            > 本项目由 AI 制作，使用前请自行审阅代码。
