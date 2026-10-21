@@ -129,6 +129,18 @@
   它会用选择题问你连接方式、让你拔插设备对比，测出回包结构后把 json 写进
   device 文件夹；不需要你懂代码或抓协议。
 
+【某台设备读不到电量 / 反馈】
+  ① 先试「自己加设备」那节：让 AI 带你测一遍。
+  ② 测不出来时，AI 会生成一份「反馈-<设备名>.md」，里面记录了 VID/PID、
+     接口、试过的请求和回包、卡在哪一步。
+  ③ 打开下面地址新建一条 issue（需要 GitHub 账号，一分钟注册）：
+       https://github.com/ziyingguogreater/PeriphBattery/issues/new
+     标题写「无法读取电量：<设备名>（VID:PID）」，
+     正文粘贴报告内容，附件拖入日志：
+       %APPDATA%\PeriphBatteryTray\app.log
+  报告里 MAC、序列号等隐私可以打码，但 VID/PID、usage、请求与回包
+  十六进制、卡在哪一步请保留，否则没法定位。
+
 【配置文件 config.json】
   注意：config.json 与 device 文件夹都在程序所在目录，程序需要对目录有写权限。
   放进 C://Program Files 这类受保护目录会存不住配置，请放在用户目录或桌面。
