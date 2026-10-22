@@ -404,7 +404,7 @@ def probe(path, payload_hex, length=64, timeout=1.0):
 2. …
 
 ## 附件
-- 日志：%APPDATA%\PeriphBatteryTray\app.log（贴最后 200 行）
+- 日志：程序目录下的 app.log（和 PeriphBattery.exe 同一文件夹，贴最后 200 行）
 - 尝试过的配置文件（如果有）
 ```
 
@@ -419,7 +419,7 @@ def probe(path, payload_hex, length=64, timeout=1.0):
 > 1. 打开上面的链接（需要 GitHub 账号，没有的话注册一个，一分钟）
 > 2. 标题填 `无法读取电量：<设备名>（<VID:PID>）`
 > 3. 把 `反馈-<设备名>.md` 的内容整段粘贴到正文
-> 4. 把 `%APPDATA%\PeriphBatteryTray\app.log` 拖进附件
+> 4. 把程序目录下的 `app.log`（和 PeriphBattery.exe 同一文件夹）拖进附件
 > 5. 点 **Submit new issue** 提交
 >
 > 不方便注册 GitHub 的话，把这份文件发给任何能联系到作者的人帮忙代发也行。

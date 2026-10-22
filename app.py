@@ -40,7 +40,7 @@ from tkinter import ttk
 
 APP_NAME = "外设电量监视"
 APP_ID = "PeriphBatteryTray"
-APP_VERSION = "1.0.5"
+APP_VERSION = "1.0.6"
 AUTOSTART_FLAG = "--autostart"      # 开机自启时带这个参数，用于区分手动/自动
 SUMMARY_MAX_LINES = 4               # 启动通知里最多列几台设备
 
@@ -63,17 +63,45 @@ def data_dir() -> str:
 
 
 CFG_PATH = os.path.join(app_dir(), "config.json")
-LOG_PATH = os.path.join(data_dir(), "app.log")
+LOG_PATH = os.path.join(app_dir(), "app.log")     # 和 exe 放一起，方便用户附带反馈
+AI_PROMPT_NAME = "AI提示词-生成设备配置.md"
 
 log = logging.getLogger(APP_ID)
 log.setLevel(logging.INFO)
-_handler = logging.handlers.RotatingFileHandler(
-    LOG_PATH, maxBytes=512 * 1024, backupCount=2, encoding="utf-8"
-)
-_handler.setFormatter(logging.Formatter("%(asctime)s  %(levelname)-5s  %(message)s"))
-log.addHandler(_handler)
+
+# 日志初始化：程序目录可能不可写（比如放进 C:\Program Files）。
+# 这里不弹窗，只记住状态，等 Tk 起来后由 run() 提示用户（需求要求主线程弹窗）。
+_LOG_FILE_OK = False
+_LOG_FILE_ERR = None
+try:
+    _handler = logging.handlers.RotatingFileHandler(
+        LOG_PATH, maxBytes=512 * 1024, backupCount=2, encoding="utf-8"
+    )
+    _handler.setFormatter(
+        logging.Formatter("%(asctime)s  %(levelname)-5s  %(message)s"))
+    log.addHandler(_handler)
+    _LOG_FILE_OK = True
+except Exception as _e:       # noqa: BLE001
+    _LOG_FILE_ERR = _e
 
 # ---------------------------------------------------------------- 配置
+
+def ask_yes_no(title: str, text: str, warning: bool = True) -> bool:
+    """原生是/否弹窗（置顶，不依赖 Tk）。返回 True 表示用户点了「是」。"""
+    try:
+        mb = ctypes.windll.user32.MessageBoxW
+        mb.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p,
+                       ctypes.c_wchar_p, ctypes.c_uint]
+        mb.restype = ctypes.c_int
+        flags = 0x00000004 | 0x00010000 | 0x00040000      # YESNO | SETFOREGROUND | TOPMOST
+        if warning:
+            flags |= 0x00000030                            # ICONWARNING
+        return mb(None, text, title, flags) == 6           # IDYES
+    except Exception as e:
+        log.warning("确认弹窗失败: %s", e)
+        return False
+
+
 
 DEFAULTS = {
     "interval_sec": 60,
@@ -90,12 +118,55 @@ PRESET_THRESHOLDS = (10, 15, 20, 25, 30, 40, 50)
 CUSTOM_CHOICE = "自定义…"
 
 
+CONFIG_EXISTED = os.path.exists(CFG_PATH)      # 首次使用判定：配置文件是否存在
+CONFIG_WAS_RESET = False                       # 损坏后被重置过，就不再弹首次引导
+
+
+def _read_user_config():
+    """读配置；返回 (数据, 损坏原因)。文件不存在不算异常。"""
+    if not os.path.exists(CFG_PATH):
+        return None, None
+    try:
+        with open(CFG_PATH, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+    except Exception as e:                      # noqa: BLE001
+        return None, "JSON 解析失败：%s" % e
+    if not isinstance(raw, dict):
+        return None, "顶层不是对象（%s）" % type(raw).__name__
+    return raw, None
+
+
+def _handle_broken_config(reason: str) -> dict:
+    """配置损坏：问用户是否重置为默认；不重置就退出。"""
+    global CONFIG_WAS_RESET
+    log.error("配置文件异常：%s（%s）", reason, CFG_PATH)
+    text = ("配置文件 config.json 已损坏或格式错误，程序无法正常读取。\n"
+            "是否使用默认设置覆盖当前配置文件？\n\n"
+            "【是】：直接覆盖为默认配置继续运行\n"
+            "【否】：程序立即退出")
+    if not ask_yes_no("配置文件异常", text):
+        log.info("配置文件异常，用户选择退出程序")
+        sys.exit(0)
+    fresh = json.loads(json.dumps(DEFAULTS))
+    if not save_config(fresh):
+        log.error("重置配置文件失败：%s", CFG_PATH)
+        ask_yes_no("重置失败",
+                   "重置配置文件失败，程序即将退出。\n"
+                   "请检查程序目录是否可写，或把程序移动到可读写目录。",
+                   warning=True)
+        sys.exit(1)
+    CONFIG_WAS_RESET = True
+    log.info("配置文件异常，用户选择重置为默认配置")
+    return fresh
+
+
 def load_config() -> dict:
     cfg = json.loads(json.dumps(DEFAULTS))
     try:
-        if os.path.exists(CFG_PATH):
-            with open(CFG_PATH, "r", encoding="utf-8") as f:
-                user = json.load(f)
+        user, broken = _read_user_config()
+        if broken:
+            return _handle_broken_config(broken)
+        if user is not None:
             for k, v in user.items():
                 if k == "devices":
                     # 旧版按「鼠标/键盘」写死的配置，已被 device_settings 取代
@@ -159,7 +230,9 @@ def save_config(cfg: dict) -> bool:
             return False
 
 
-CFG = load_config()
+# 占位：真正的读取放在 main() 里、单实例检查之后。
+# 否则第二个实例会先弹「配置损坏」甚至改写配置，再才发现已有实例在跑。
+CFG = json.loads(json.dumps(DEFAULTS))
 
 # ---------------------------------------------------------------- 图标
 
@@ -2199,6 +2272,183 @@ class SettingsDialog:
         self.app.settings_dialog = None
 
 
+
+class WelcomeDialog:
+    """首次使用的欢迎引导（不写注册表：只在 config.json 不存在时出现）。"""
+
+    BODY = """欢迎使用外设电量监视！
+
+本程序用于读取无线外设（鼠标、键盘、蓝牙设备）的剩余电量，常驻系统托盘运行。
+
+【基础使用】
+1. 程序启动后自动扫描已支持的外设；
+2. 鼠标右键点击托盘图标打开菜单，可设置低电量提醒阈值；
+3. 左键单击托盘图标打开设置窗口，可以启用/禁用设备、修改提醒、设置开机自启。
+
+【添加设备配置文件】
+如果你的设备暂未被支持，可以添加自定义设备配置：
+1. 在程序目录打开 device 文件夹；
+2. 将设备 json 配置放入 device 目录；
+3. 在托盘菜单打开「配置文件…」窗口，点击刷新即可加载。
+
+【提示】
+· 程序为便携版本，可以直接复制整个文件夹移动使用；
+· 读不到电量可以查看 app.log 日志（和 PeriphBattery.exe 在同一文件夹），
+  通过 GitHub Issue 反馈问题；
+· 你可以点击下方按钮直接管理设备配置文件。
+
+点击【完成】关闭此引导窗口，程序就可以正常使用。"""
+
+    def __init__(self, app_ref):
+        self.app = app_ref
+        self.scale = max(1.0, system_dpi() / 96.0)
+        self._font_title = tkfont.Font(family="Microsoft YaHei UI", size=14, weight="bold")
+        self._font_body = tkfont.Font(family="Microsoft YaHei UI", size=9)
+        self.win = tk.Toplevel(app_ref.root)
+        self.win.withdraw()
+        self.win.title("欢迎使用 " + APP_NAME)
+        self.win.configure(bg=UI_BG)
+        self.win.resizable(False, False)
+        setup_ttk_style(self.win)
+        self._build()
+        self._fit_and_center()
+        try:
+            apply_dark_titlebar(self.win)
+        except Exception:
+            pass
+        # 窗口图标：不设的话标题栏和任务栏都是 Tk 默认的羽毛
+        self._icon_photo = None
+        try:
+            self._icon_photo = tk.PhotoImage(file=self.app.icon_png)
+            self.win.iconphoto(True, self._icon_photo)
+        except Exception as e:      # noqa: BLE001
+            log.debug("引导窗口图标设置失败: %s", e)
+        self.win.protocol("WM_DELETE_WINDOW", self.finish)
+        self.win.deiconify()
+        try:
+            self.win.transient()
+            self.win.grab_set()
+        except Exception:
+            pass
+        self._raise_to_front()
+        log.info("首次使用：欢迎引导已显示")
+
+    def _raise_to_front(self):
+        """开机自启时桌面上可能已经开着别的窗口，把引导窗口抬到最前。
+
+        这是个模态窗口（grab_set 之后别的窗口本来也点不动），所以全程置顶，
+        关闭时一起收掉，避免"弹在后台看不见"。"""
+        try:
+            self.win.lift()
+            self.win.attributes("-topmost", True)
+            self.win.focus_force()
+            self.win.after(200, self.win.focus_force)
+        except Exception as e:      # noqa: BLE001
+            log.debug("引导窗口置顶失败: %s", e)
+
+    def px(self, v: float) -> int:
+        return int(round(v * self.scale))
+
+    def _build(self):
+        pad = self.px(26)
+        outer = tk.Frame(self.win, bg=UI_BG)
+        outer.pack(fill="both", expand=True, padx=pad, pady=(pad, self.px(6)))
+
+        tk.Label(outer, text="欢迎使用 " + APP_NAME + "！", bg=UI_BG, fg=UI_FG,
+                 font=self._font_title, anchor="center", justify="center").pack(fill="x")
+        tk.Frame(outer, bg=UI_LINE, height=max(1, self.px(1))).pack(
+            fill="x", pady=(self.px(12), self.px(14)))
+
+        # 用 Label + wraplength 排版：高度随内容自适应，不需要固定 Text 行数
+        body = tk.Label(outer, text=self.BODY, bg=UI_BG, fg=UI_SUB,
+                        font=self._font_body, justify="left", anchor="w",
+                        wraplength=self.px(520))
+        body.pack(fill="x")
+
+        bar = tk.Frame(self.win, bg=UI_BG)
+        bar.pack(fill="x", padx=pad, pady=(self.px(4), pad))
+        # 两个按钮作为一组整体居中（内层 frame 按内容宽度居中）
+        inner = tk.Frame(bar, bg=UI_BG)
+        inner.pack(anchor="center")
+        ttk.Button(inner, text="打开配置文件管理",
+                   command=self.open_profiles).pack(side="left")
+        ttk.Button(inner, text="完成", command=self.finish).pack(
+            side="left", padx=(self.px(12), 0))
+
+    def _fit_and_center(self):
+        """按内容算出窗口大小（DPI 已缩放），再放到屏幕正中。"""
+        try:
+            self.win.tk.call("tk", "scaling", system_dpi() / 72.0)
+        except Exception:
+            pass
+        try:
+            self.win.update_idletasks()
+            w = self.win.winfo_reqwidth() + self.px(2)
+            h = self.win.winfo_reqheight() + self.px(2)
+            sw = self.win.winfo_screenwidth()
+            sh = self.win.winfo_screenheight()
+            x = max(0, int((sw - w) / 2))
+            y = max(0, int((sh - h) / 2))
+            self.win.geometry("%dx%d+%d+%d" % (w, h, x, y))
+        except Exception as e:      # noqa: BLE001
+            log.debug("欢迎引导窗口定位失败: %s", e)
+
+    def open_profiles(self):
+        """以独立非模态窗口打开配置管理，引导窗口保持打开。"""
+        try:
+            self.win.grab_release()      # 临时让出模态，否则配置窗口点不动
+        except Exception:
+            pass
+        try:
+            self.app.open_profiles_window()   # 内部是 root.after(0, ...)，窗口不会立刻存在
+            self._attach_profiles()
+            log.info("欢迎引导：已请求打开配置文件管理窗口")
+        except Exception:
+            log.exception("欢迎引导：打开配置文件管理失败")
+            self._regrab()
+
+    def _attach_profiles(self, tries: int = 0):
+        """等配置窗口真正建出来再挂关闭事件；一直没建出来就恢复模态。"""
+        dlg = getattr(self.app, "profiles_dialog", None)
+        if dlg is not None and dlg.win.winfo_exists():
+            win = dlg.win
+            win.bind("<Destroy>", lambda e, w=win: self._on_profiles_closed(e, w), add="+")
+            return
+        if tries < 20:
+            try:
+                self.win.after(50, lambda: self._attach_profiles(tries + 1))
+            except Exception:
+                pass
+        else:
+            log.warning("欢迎引导：配置窗口未能打开，恢复模态")
+            self._regrab()
+
+    def _on_profiles_closed(self, event, win):
+        if event.widget is not win:
+            return
+        self._regrab()
+
+    def _regrab(self):
+        try:
+            if self.win.winfo_exists():
+                self.win.grab_set()      # 配置窗口关掉后恢复引导窗口的模态
+        except Exception:
+            pass
+
+    def finish(self):
+        try:
+            self.win.grab_release()
+            self.win.attributes("-topmost", False)
+        except Exception:
+            pass
+        try:
+            self.win.destroy()
+        except Exception:
+            pass
+        self.app.welcome_dialog = None
+        log.info("首次使用引导已完成")
+
+
 class ProfilesDialog:
     """已加载的设备配置文件（独立窗口，列表可滚动）。
 
@@ -2308,7 +2558,24 @@ class ProfilesDialog:
                    command=self.open_folder).pack(side="left", padx=self.px(8))
         ttk.Button(bar, text="刷新", command=self.refresh).pack(
             side="left", padx=(0, self.px(8)))
+        ttk.Button(bar, text="查看AI设备配置提示词",
+                   command=self.open_ai_prompt).pack(side="left")
         ttk.Button(bar, text="关闭", command=self.close).pack(side="right")
+
+    def open_ai_prompt(self):
+        """打开随身携带的「AI 提示词」，帮用户生成自己的设备配置。"""
+        path = os.path.join(app_dir(), AI_PROMPT_NAME)
+        if not os.path.isfile(path):
+            log.warning("%s 文件不存在：%s", AI_PROMPT_NAME, path)
+            show_error_dialog(self.win,
+                              "未找到 AI 设备配置提示词文件，请重新下载完整便携包。")
+            return
+        try:
+            os.startfile(path)
+            log.info("打开AI设备配置提示词文档：%s", path)
+        except Exception as e:      # noqa: BLE001
+            log.warning("打开AI设备配置提示词失败: %s", e)
+            show_error_dialog(self.win, "打开失败：%s" % e)
 
     def _on_wheel(self, event):
         try:
@@ -2477,6 +2744,7 @@ class App:
         self._need_menu_refresh = False   # 阈值变化后重建托盘菜单
         self.mute_alerts = False     # 临时停用低电量通知（只在本次运行有效）
         self._loop_err_ts = 0.0      # 主循环异常日志的限频时间戳
+        self._save_warned = False    # 配置保存失败只提示一次
         self.notify_ok = True        # 通知权限是否可用（启动时读注册表）
         self.notify_notes = []
         self._last_notify_check = 0.0
@@ -3093,10 +3361,25 @@ class App:
             log.warning("忽略无效的阈值: %r", value)
             return
         self.cfg["low_threshold"] = value
-        save_config(self.cfg)
+        if not save_config(self.cfg):
+            self._warn_save_failed()
         self.check_threshold_now()      # 新阈值下已达标的设备立刻提醒
         self._need_menu_refresh = True  # 打勾项要跟着动
         self._sync_threshold_to_ui(value)
+
+    def _warn_save_failed(self):
+        """保存失败只提示一次，避免连续操作时反复弹窗。"""
+        if getattr(self, "_save_warned", False):
+            return
+        self._save_warned = True
+        log.error("配置保存失败（程序目录可能不可写）：%s", CFG_PATH)
+        try:
+            self.root.after(0, lambda: show_error_dialog(
+                self.root,
+                "设置已在本次运行生效，但写入 config.json 失败。\n"
+                "程序目录可能没有写权限，重启后这些设置会丢失。"))
+        except Exception:
+            pass
 
     def _sync_threshold_to_ui(self, value):
         """菜单改阈值后，把界面上的阈值控件同步过去（设置窗口开着才有意义）。"""
@@ -3136,7 +3419,8 @@ class App:
 
     def toggle_autostart(self, icon=None, item=None):
         self.cfg["start_with_windows"] = not self.cfg.get("start_with_windows", False)
-        save_config(self.cfg)
+        if not save_config(self.cfg):
+            self._warn_save_failed()
         apply_autostart(self.cfg["start_with_windows"])
 
     def self_check(self, icon=None, item=None):
@@ -3186,6 +3470,11 @@ class App:
         threading.Thread(target=work, daemon=True).start()
 
     def open_log(self, icon=None, item=None):
+        if not os.path.exists(LOG_PATH):
+            show_error_dialog(self.root,
+                              "当前没有日志文件：\n%s\n\n"
+                              "可能是程序目录不可写，或还没有产生日志。" % LOG_PATH)
+            return
         try:
             subprocess.Popen(["notepad.exe", LOG_PATH])
         except Exception as e:
@@ -3218,6 +3507,11 @@ class App:
         except Exception as e:
             log.debug("根窗口图标设置失败: %s", e)
 
+        if not _LOG_FILE_OK:
+            self._check_log_writable()
+        if (not CONFIG_EXISTED) and (not CONFIG_WAS_RESET):
+            self._show_welcome()
+
         self.rebuild_devices()
         threading.Thread(target=self.ui_loop, daemon=True).start()
         threading.Thread(target=self._tray_thread, daemon=True).start()
@@ -3229,6 +3523,26 @@ class App:
 
         log.info("==== 启动 v%s ==== (autostart=%s)", APP_VERSION, self.autostart)
         self.root.mainloop()
+
+    def _check_log_writable(self):
+        """程序目录不可写时的提示：继续（不写日志）或退出。"""
+        log.warning("日志文件无法写入：%s（%s）", LOG_PATH, _LOG_FILE_ERR)
+        if ask_yes_no(
+                "无法写入日志",
+                "无法在当前目录写入日志文件，请把程序移动到可读写目录运行。\n\n"
+                "【是】：继续运行（本次不写日志文件）\n"
+                "【否】：退出程序"):
+            log.info("用户选择继续运行（本次不写日志文件）")
+            return
+        log.info("用户选择退出（日志不可写）")
+        sys.exit(0)
+
+    def _show_welcome(self):
+        try:
+            self.welcome_dialog = WelcomeDialog(self)
+        except Exception:
+            log.exception("欢迎引导窗口创建失败，跳过引导")
+            self.welcome_dialog = None
 
     def _tray_thread(self):
         menu = Menu(
@@ -3329,12 +3643,15 @@ def show_startup_error() -> None:
 
 
 def main():
+    global CFG
     enable_dpi_awareness()          # 只为让提示框清晰，不改任何状态
     # 绝对优先：已有实例就直接提示退出，不写配置、不建托盘、不加载设备
     if not single_instance():
         log.info("已有实例在运行，已提示并退出")
         show_startup_error()
         return
+    # 到这里才读配置：损坏时的弹窗/重置只会发生在真正的首个实例里
+    CFG = load_config()
     if not os.path.exists(CFG_PATH):
         save_config(CFG)
     if CFG.get("start_with_windows"):

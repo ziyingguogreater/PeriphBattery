@@ -5,3 +5,5 @@ build/
 dist/
 *.log
 config.json
+app.log
+app.log.*

@@ -104,12 +104,20 @@ build.bat              一键打包脚本
    让它带你测一遍。测不出来时它会先判断**是设备本身没这个功能，还是只是没测出来**：
    前者直接用人话解释原因，后者才生成 `反馈-<设备名>.md`
 2. 到 [Issues](https://github.com/ziyingguogreater/PeriphBattery/issues/new) 新建一条，
-   把报告整段贴进去，附上 `%APPDATA%\PeriphBatteryTray\app.log`
+   把报告整段贴进去，附上程序目录下的 `app.log`（和 `PeriphBattery.exe` 同一个文件夹）
 
 报告里最关键的是：VID/PID、usage_page/usage、试过的请求与回包十六进制、卡在哪一步。
 有这些基本能定位问题；只说「不能用」很难查。
 
 ## 更新日志
+
+### v1.0.6
+
+- 新增配置文件损坏检测：`config.json` 解析失败或结构损坏时弹出提示，可一键重置为默认配置
+- 新增首次使用引导：首次运行（没有 `config.json`）时介绍基本用法，并可直接打开配置文件管理窗口
+- 配置文件管理窗口新增「查看AI设备配置提示词」按钮，一键打开随包的提示词文档
+- 日志文件 `app.log` 改为输出在程序目录（和 `PeriphBattery.exe` 同一文件夹），
+  目录不可写时会提示用户继续运行或退出
 
 ### v1.0.5
 
@@ -181,4 +189,4 @@ build.bat              一键打包脚本
 人类负责提需求、接设备实测并逐条验收。
 
 **再次提醒：AI 生成的代码请自行审阅后再使用。** 发现问题是正常现象，
-欢迎开 Issue 说明现象与日志（`%APPDATA%\PeriphBatteryTray\app.log`），我会继续修。
+欢迎开 Issue 说明现象与日志（程序目录下的 `app.log`），我会继续修。
