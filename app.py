@@ -125,22 +125,38 @@ def load_config() -> dict:
     return cfg
 
 
+_CFG_SAVE_LOCK = threading.Lock()
+
+
 def save_config(cfg: dict) -> bool:
-    """先写临时文件再替换，写一半失败也不会把原配置毁掉。返回是否写成功。"""
-    tmp = CFG_PATH + ".tmp"
-    try:
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(cfg, f, ensure_ascii=False, indent=2)
-        os.replace(tmp, CFG_PATH)
-        return True
-    except Exception as e:
-        log.warning("配置保存失败: %s", e)
+    """先写临时文件再替换，写一半失败也不会把原配置毁掉。
+
+    设置窗口和托盘菜单可能同时保存，所以：①整体加锁串行化；
+    ②临时文件用唯一名字，避免两个线程互相覆盖/删掉对方正在写的文件；
+    ③先做一份快照，避免别的线程在序列化途中改动字典。"""
+    tmp = "%s.%s.tmp" % (CFG_PATH, uuid.uuid4().hex[:8])
+    with _CFG_SAVE_LOCK:
         try:
-            if os.path.exists(tmp):
-                os.remove(tmp)
-        except Exception:
-            pass
-        return False
+            for _ in range(3):
+                try:
+                    data = json.dumps(dict(cfg), ensure_ascii=False, indent=2)
+                    break
+                except RuntimeError:      # 另一线程正在改字典，稍等重试
+                    time.sleep(0.01)
+            else:
+                raise RuntimeError("配置在序列化期间被持续修改")
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write(data)
+            os.replace(tmp, CFG_PATH)
+            return True
+        except Exception as e:
+            log.warning("配置保存失败: %s", e)
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except Exception:
+                pass
+            return False
 
 
 CFG = load_config()
@@ -397,7 +413,10 @@ def _strip_control(text: str) -> str:
 def show_toast(title: str, msg: str, icon_path: str, silent: bool = False) -> None:
     title = _strip_control(title or "")
     msg = _strip_control(msg or "")
-    src = "file:///" + icon_path.replace("\\", "/")
+    # src 是 XML 属性值：路径里可能有 & " 等字符，必须转义；
+    # 空格/中文按 URI 规则编码，否则 Windows 解析不出来
+    from urllib.parse import quote as _quote
+    src = "file:///" + _quote((icon_path or "").replace("\\", "/"), safe="/:")
     audio_xml = ('<audio silent="true"/>' if silent else
                  '<audio src="ms-winsoundevent:Notification.Looping.Alarm" loop="false"/>')
     xml = (
@@ -407,7 +426,8 @@ def show_toast(title: str, msg: str, icon_path: str, silent: bool = False) -> No
         '<image placement="appLogoOverride" hint-crop="circle" src="%s"/>'
         '</binding></visual>%s'
         '</toast>' % ("short" if silent else "long",
-                      _xml_escape(title), _xml_escape(msg), src, audio_xml)
+                      _xml_escape(title), _xml_escape(msg),
+                      _xml_escape(src), audio_xml)
     )
     # 每条通知用独立临时文件：低电量、接入提示、自检可能同时来自不同线程，
     # 共用一个 toast.ps1 会互相覆盖
@@ -3272,6 +3292,12 @@ def single_instance() -> bool:
     global _mutex_handle
     try:
         k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        # 不声明 restype 时 ctypes 按 c_int 返回，64 位下句柄会被截断
+        k32.CreateMutexW.argtypes = [ctypes.c_void_p, ctypes.c_int,
+                                     ctypes.c_wchar_p]
+        k32.CreateMutexW.restype = ctypes.c_void_p
+        k32.CloseHandle.argtypes = [ctypes.c_void_p]
+        k32.CloseHandle.restype = ctypes.c_int
         handle = k32.CreateMutexW(None, False, "Local\\%s" % APP_ID)
         err = ctypes.get_last_error()
         if not handle:
