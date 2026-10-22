@@ -2287,8 +2287,8 @@ class WelcomeDialog:
 
 【添加设备配置文件】
 如果你的设备暂未被支持，可以添加自定义设备配置：
-1. 在程序目录打开 device 文件夹；
-2. 将设备 json 配置放入 device 目录；
+1. 在程序目录打开配置文件夹（device）；
+2. 将设备 json 配置放入该目录；
 3. 在托盘菜单打开「配置文件…」窗口，点击刷新即可加载。
 
 【提示】
@@ -2466,7 +2466,7 @@ class ProfilesDialog:
         self.win.resizable(False, False)
         setup_ttk_style(self.win)      # 独立打开时也要有深色按钮/滚动条
         self._build()
-        self._center(560, 400)
+        self._center(560, 440)
         try:
             photo = parent._icon_photo if parent else tk.PhotoImage(file=self.app.icon_png)
             self._icon_photo = photo
@@ -2550,17 +2550,20 @@ class ProfilesDialog:
             "<MouseWheel>", self._on_wheel))
         self._canvas.bind("<Leave>", lambda e: self.win.unbind_all("<MouseWheel>"))
 
+        # 两行按钮：常用操作一行，辅助操作一行，避免单行过挤
         bar = tk.Frame(outer, bg=UI_BG)
         bar.pack(fill="x", pady=(self.px(10), 0))
         ttk.Button(bar, text="添加配置文件…",
                    command=self.add_profile).pack(side="left")
-        ttk.Button(bar, text="打开 device 文件夹",
+        ttk.Button(bar, text="打开 配置文件夹",
                    command=self.open_folder).pack(side="left", padx=self.px(8))
-        ttk.Button(bar, text="刷新", command=self.refresh).pack(
-            side="left", padx=(0, self.px(8)))
-        ttk.Button(bar, text="查看AI设备配置提示词",
+        ttk.Button(bar, text="刷新", command=self.refresh).pack(side="left")
+
+        bar2 = tk.Frame(outer, bg=UI_BG)
+        bar2.pack(fill="x", pady=(self.px(8), 0))
+        ttk.Button(bar2, text="查看AI设备配置提示词",
                    command=self.open_ai_prompt).pack(side="left")
-        ttk.Button(bar, text="关闭", command=self.close).pack(side="right")
+        ttk.Button(bar2, text="关闭", command=self.close).pack(side="right")
 
     def open_ai_prompt(self):
         """打开随身携带的「AI 提示词」，帮用户生成自己的设备配置。"""
@@ -2592,7 +2595,7 @@ class ProfilesDialog:
         profs = list(PROFILES)
         self._title.configure(text="已加载 %d 个配置文件" % len(profs))
         if not profs:
-            tk.Label(self._list, text="device 文件夹里还没有可用的配置文件",
+            tk.Label(self._list, text="配置文件夹里还没有可用的配置文件",
                      bg=UI_CARD, fg=UI_SUB,
                      font=("Microsoft YaHei UI", 9)).pack(
                 anchor="w", padx=self.px(6), pady=self.px(10))
@@ -2670,7 +2673,7 @@ class ProfilesDialog:
                 shutil.copyfile(path, dst)
         except Exception as e:
             log.warning("复制配置文件失败: %s（%s）", path, e)
-            self._error("无法写入 device 文件夹")
+            self._error("无法写入配置文件夹")
             return False
 
         log.info("已添加配置文件: %s → %s", path, dst)
@@ -3168,7 +3171,7 @@ class App:
         tip = "\n".join(lines)
         if not have_profiles:
             tip = _with_hint(lines, [
-                "把设备配置文件放进 device 文件夹后即可监视",
+                "把设备配置文件放进配置文件夹后即可监视",
                 "单击此处打开配置文件列表",
             ])
         elif badged:
