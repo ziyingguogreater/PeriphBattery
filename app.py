@@ -40,7 +40,7 @@ from tkinter import ttk
 
 APP_NAME = "外设电量监视"
 APP_ID = "PeriphBatteryTray"
-APP_VERSION = "1.0.4"
+APP_VERSION = "1.0.5"
 AUTOSTART_FLAG = "--autostart"      # 开机自启时带这个参数，用于区分手动/自动
 SUMMARY_MAX_LINES = 4               # 启动通知里最多列几台设备
 
@@ -1205,6 +1205,7 @@ class BaseDevice:
         self.dev = None
         self.retired = False
         self._evt = None
+        self._thread = None      # 负责轮询本设备的线程
         self.fail = 0
         self.last_product = info.product or info.key
         # 同一个设备的请求/回包必须串行：后台轮询线程和「运行自检」
@@ -2390,7 +2391,12 @@ class ProfilesDialog:
         return True
 
     def _error(self, msg: str):
-        show_error_dialog(self.win, msg)
+        # 统一回 Tk 主线程弹窗，避免后台线程调用时报
+        # "main thread is not in main loop"
+        try:
+            self.win.after(0, lambda: show_error_dialog(self.win, msg))
+        except Exception:
+            show_error_dialog(self.win, msg)
 
     def open_folder(self):
         try:
@@ -2566,6 +2572,12 @@ class App:
             dev = existing.get(key)
             if dev is not None:
                 if dev.force_mode == mode:
+                    t = getattr(dev, "_thread", None)
+                    if t is not None and not t.is_alive():
+                        # 线程意外退出（异常、系统休眠等）→ 重新拉起，否则这台设备
+                        # 会一直停在旧读数上，不会再刷新
+                        log.warning("[%s] 轮询线程已退出，重新启动", dev.name())
+                        self._start_worker(dev)
                     continue
                 # 连接方式（auto/wired/wireless）只在构造时生效，
                 # 配置改了必须重建，否则旧对象还按老方式解析
@@ -2593,58 +2605,69 @@ class App:
     def _start_worker(self, dev: BaseDevice):
         evt = threading.Event()
         dev._evt = evt
-        threading.Thread(target=self._worker, args=(dev, evt), daemon=True).start()
+        t = threading.Thread(target=self._worker, args=(dev, evt), daemon=True)
+        dev._thread = t
+        t.start()
 
     def _worker(self, dev: BaseDevice, evt: threading.Event):
         while not self.stop_evt.is_set() and not dev.retired:
             try:
-                rd = dev.poll_forced()
-            except Exception as e:
-                log.exception("轮询异常 %s", e)
-                rd = Reading(connected=False, error=str(e))
-
-            with self.lock:
-                prev = self.readings.get(dev.key) or Reading(connected=False)
-
-            if rd.connected:
-                dev.fail = 0
-            else:
-                dev.fail += 1
-                # 设备关机/接收器收不到设备是明确信号，别拿旧电量糊弄；
-                # 只有读取异常这种偶发失败才短暂保留上一轮数值
-                soft = bool(rd.error) and ("无响应" in rd.error or "关机" in rd.error)
-                if (not soft and dev.fail < 2 and prev.connected
-                        and prev.level is not None):
-                    rd = Reading(connected=True, level=prev.level, charging=prev.charging,
-                                 wired=prev.wired, error="连接不稳定")
-                # 连续失败到一定次数：可能是换了连接方式（PID 变了），
-                # 旧 path 永远打不开，需要重新枚举一次设备表
-                elif dev.fail == 4:
-                    self._need_rescan = True
-                    log.info("[%s] 连续读取失败，触发设备表重新扫描", dev.name())
-
-            with self.lock:
-                self.readings[dev.key] = rd
-
-            if (prev.level != rd.level or prev.connected != rd.connected
-                    or prev.wired != rd.wired):
-                log.info("[%s] conn=%s wired=%s level=%s charge=%s %s",
-                         dev.name(), rd.connected, rd.wired, rd.level, rd.charging, rd.error)
-
-            if rd.connected and not prev.connected:
-                self._on_connected(dev, rd)
-
-            self._maybe_alert(dev, rd)
-
-            interval = self.cfg.get("interval_sec", 60)
-            # 先等再清：等的时候被 set（立即刷新）会马上返回，随后照旧
-            # 走下一轮 poll，所以这里 clear 不会吞掉刷新请求
-            evt.wait(interval if rd.connected else min(interval, 5))
-            evt.clear()
+                self._poll_once(dev, evt)
+            except Exception:
+                # 关键：整轮都要兜住。异常一旦冒出去，这个线程就没了，
+                # 设备会永远停在旧状态（开机启动时最容易踩到）。
+                log.exception("[%s] 轮询循环异常，1 秒后继续", dev.name())
+                time.sleep(1.0)
 
         # 句柄由这里关：此时本线程不再读它，不会和别的线程抢同一个设备
         dev.close()
         log.info("[%s] 轮询线程退出", dev.name())
+
+    def _poll_once(self, dev: BaseDevice, evt: threading.Event):
+        try:
+            rd = dev.poll_forced()
+        except Exception as e:
+            log.exception("轮询异常 %s", e)
+            rd = Reading(connected=False, error=str(e))
+
+        with self.lock:
+            prev = self.readings.get(dev.key) or Reading(connected=False)
+
+        if rd.connected:
+            dev.fail = 0
+        else:
+            dev.fail += 1
+            # 设备关机/接收器收不到设备是明确信号，别拿旧电量糊弄；
+            # 只有读取异常这种偶发失败才短暂保留上一轮数值
+            soft = bool(rd.error) and ("无响应" in rd.error or "关机" in rd.error)
+            if (not soft and dev.fail < 2 and prev.connected
+                    and prev.level is not None):
+                rd = Reading(connected=True, level=prev.level, charging=prev.charging,
+                             wired=prev.wired, error="连接不稳定")
+            # 连续失败到一定次数：可能是换了连接方式（PID 变了），
+            # 旧 path 永远打不开，需要重新枚举一次设备表
+            elif dev.fail >= 4 and dev.fail % 4 == 0:
+                self._need_rescan = True
+                log.info("[%s] 连续读取失败，触发设备表重新扫描", dev.name())
+
+        with self.lock:
+            self.readings[dev.key] = rd
+
+        if (prev.level != rd.level or prev.connected != rd.connected
+                or prev.wired != rd.wired):
+            log.info("[%s] conn=%s wired=%s level=%s charge=%s %s",
+                     dev.name(), rd.connected, rd.wired, rd.level, rd.charging, rd.error)
+
+        if rd.connected and not prev.connected:
+            self._on_connected(dev, rd)
+
+        self._maybe_alert(dev, rd)
+
+        interval = self.cfg.get("interval_sec", 60)
+        # 先等再清：等的时候被 set（立即刷新）会马上返回，随后照旧
+        # 走下一轮 poll，所以这里 clear 不会吞掉刷新请求
+        evt.wait(interval if rd.connected else min(interval, 5))
+        evt.clear()
 
     def refresh_now(self):
         if not self._devices:       # 没有在监视的设备，刷新没有意义
@@ -2708,6 +2731,13 @@ class App:
             log.info("通知权限不可用，跳过启动提示")
             return
         try:
+            # 开机自启时设备栈可能还没就绪，第一次扫描会拿到空表；
+            # 这里补几次重试，免得通知说「当前没有检测到设备」，几秒后设备才冒出来
+            for _ in range(3):
+                if self._devices:
+                    break
+                time.sleep(1.0)
+                self.rebuild_devices()
             low_lines, low_count = self._device_summary_lines(only_low=True)
             if low_count and not self.mute_alerts:
                 show_toast("电量偏低，请及时充电", "\n".join(low_lines), self.alert_png)
