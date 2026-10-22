@@ -101,7 +101,8 @@ build.bat              一键打包脚本
 某台设备读不到电量、或读到的数值明显不对时：
 
 1. 把 [AI提示词-生成设备配置.md](AI提示词-生成设备配置.md) 交给能跑命令的 AI，
-   让它带你测一遍；测不出来时它会生成一份 `反馈-<设备名>.md`
+   让它带你测一遍。测不出来时它会先判断**是设备本身没这个功能，还是只是没测出来**：
+   前者直接用人话解释原因，后者才生成 `反馈-<设备名>.md`
 2. 到 [Issues](https://github.com/ziyingguogreater/PeriphBattery/issues/new) 新建一条，
    把报告整段贴进去，附上 `%APPDATA%\PeriphBatteryTray\app.log`
 
