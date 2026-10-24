@@ -160,6 +160,23 @@ def _handle_broken_config(reason: str) -> dict:
     return fresh
 
 
+def _as_bool(v, default: bool = True) -> bool:
+    """把配置里的值转成布尔。
+
+    直接 bool("false") 会得到 True，手改配置写成字符串就会把开关反了。"""
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, (int, float)):
+        return bool(v)
+    if isinstance(v, str):
+        s = v.strip().lower()
+        if s in ("false", "0", "no", "off", ""):
+            return False
+        if s in ("true", "1", "yes", "on"):
+            return True
+    return default
+
+
 def load_config() -> dict:
     cfg = json.loads(json.dumps(DEFAULTS))
     try:
@@ -193,6 +210,32 @@ def load_config() -> dict:
         cfg["custom_threshold"] = 0      # 和预设重合就没必要单独留一项
     cfg["interval_sec"] = max(2, cfg["interval_sec"])
     cfg["alert_repeat_min"] = max(1, cfg["alert_repeat_min"])
+
+    # 结构校验：device_settings 被手改成列表、子项写成 null 时，
+    # 后面 st.get() 会抛 AttributeError，而这条路径在启动建表时就跑，
+    # 会直接把程序打断。这里按「能用的留下，坏的丢掉」处理，不弹窗。
+    ds = cfg.get("device_settings")
+    if not isinstance(ds, dict):
+        if ds not in (None, {}, []):
+            log.warning("device_settings 不是对象（%s），已重置为空",
+                        type(ds).__name__)
+        cfg["device_settings"] = {}
+    else:
+        clean = {}
+        for key, item in ds.items():
+            if not isinstance(item, dict):
+                log.warning("设备设置 %s 不是对象（%s），已忽略",
+                            key, type(item).__name__)
+                continue
+            fixed = dict(item)      # 保留未知字段，方便以后扩展
+            fixed["enabled"] = _as_bool(item.get("enabled", True), True)
+            mode = item.get("mode", "auto")
+            if mode not in ("auto", "wired", "wireless"):
+                log.warning("设备设置 %s 的 mode=%r 无效，已改回 auto", key, mode)
+                mode = "auto"
+            fixed["mode"] = mode
+            clean[str(key)] = fixed
+        cfg["device_settings"] = clean
     return cfg
 
 
@@ -524,12 +567,33 @@ def show_toast(title: str, msg: str, icon_path: str, silent: bool = False) -> No
         log.info("已发起通知: %s", title)
     except Exception as e:
         log.warning("通知发送失败: %s", e)
-        return
+        for f in (path, xml_path, status):      # 半途失败也要收拾干净
+            try:
+                if os.path.exists(f):
+                    os.remove(f)
+            except Exception:
+                pass
+        return False
 
     def cleanup():
         # 等 PowerShell 退出再删，避免删掉还在用的文件
         try:
             proc.wait(timeout=20)
+        except Exception:
+            try:
+                proc.kill()         # 超时还挂着就收掉，别让它长期占着临时文件
+                proc.wait(timeout=5)
+            except Exception:
+                pass
+        # 脚本会把结果写进 status 文件（OK / 异常类型+消息）：
+        # 只删不看等于白写，失败时至少要在日志里留下原因
+        try:
+            if os.path.exists(status):
+                with open(status, "r", encoding="utf-8-sig",
+                          errors="replace") as f:
+                    res = f.read().strip()
+                if res and res != "OK":
+                    log.warning("通知未送达: %s（%s）", title, res)
         except Exception:
             pass
         for f in (path, xml_path, status):
@@ -540,6 +604,7 @@ def show_toast(title: str, msg: str, icon_path: str, silent: bool = False) -> No
                 pass
 
     threading.Thread(target=cleanup, daemon=True).start()
+    return True
 
 
 def diagnose_notifications():
@@ -1329,8 +1394,12 @@ class BaseDevice:
         except Exception as e:
             log.debug("[%s] open_path 失败: %s", self.key, e)
 
-        # 路径失效（换 USB 口）时重新枚举一次
+        # 路径失效（换 USB 口）时重新枚举一次。必须连 PID 一起比对：
+        # 同一厂商的两款设备可能共用 usage_page/usage，只按 VID 找会打开
+        # 另一台设备，然后把本配置的指令发过去
         for d in hid.enumerate(self.info.vid):
+            if int(d.get("product_id") or 0) != self.info.pid:
+                continue
             if d.get("usage_page") == self.info.usage_page and d.get("usage") == self.info.usage:
                 try:
                     dev = hid.device()
@@ -1415,6 +1484,16 @@ class ProfileDevice(BaseDevice):
                 return False
         return True
 
+    def _alive(self, r) -> bool:
+        """回包的链路状态字节是否符合配置；没配 alive_if 就一律算活着。
+
+        首次回包和「疑似纯供电」的重试回包都要过这一关：接收器在设备
+        关机时会把上一包缓存复述回来，只校验首包会漏掉重试包。"""
+        if not self.p.alive_if:
+            return True
+        idx, want = self.p.alive_if
+        return len(r) > idx and int(r[idx]) == want
+
     def poll(self) -> Reading:
         if self.dev is None and not self.open():
             return Reading(connected=False, error="未连接")
@@ -1428,11 +1507,9 @@ class ProfileDevice(BaseDevice):
                 return Reading(connected=False,
                                error="无响应（设备可能已关机）")
 
-            if p.alive_if:
-                idx, want = p.alive_if
-                if len(r) <= idx or int(r[idx]) != want:
-                    # 接收器把上一次的状态复述回来了，设备其实已经关机
-                    return Reading(connected=False, error="设备可能已关机")
+            if not self._alive(r):
+                # 接收器把上一次的状态复述回来了，设备其实已经关机
+                return Reading(connected=False, error="设备可能已关机")
 
             level, charge = int(r[p.level_index]), int(r[p.charge_index])
             zero = (level == 0 and charge == 0)
@@ -1445,6 +1522,8 @@ class ProfileDevice(BaseDevice):
                 # 无线连接下也回这种包：多半是刚唤醒还没采到电量，重试一次
                 r2 = self._request()
                 if r2 is not None:
+                    if not self._alive(r2):
+                        return Reading(connected=False, error="设备可能已关机")
                     lv, ch = int(r2[p.level_index]), int(r2[p.charge_index])
                     if not self._wired_hit(lv, ch):
                         wired = ch in p.charge_on
@@ -1671,6 +1750,7 @@ class SettingsDialog:
         self._tooltips = []
         self._rows = {}
         self._list_sig = None
+        self._scan_busy = False     # 后台正在枚举设备，避免 1.5 秒的 tick 反复叠加
         self._tick_id = None
         self._font9 = tkfont.Font(family="Microsoft YaHei UI", size=9)
         self.scale = self._dpi_scale()
@@ -2028,9 +2108,34 @@ class SettingsDialog:
 
     # --- 设备列表 ---
     def refresh_device_list(self):
-        """每 1.5 秒调一次：设备集合变化才重建行，否则只刷新状态文字。"""
-        self.app.rescan_devices()
-        infos = self.app.all_infos()
+        """每 1.5 秒调一次：后台枚举设备，回主线程再更新行。
+
+        枚举 HID（以及可能同步刷新的蓝牙快照）是几十到几百毫秒的阻塞调用，
+        放在 Tk 主线程里每 1.5 秒跑一次，窗口滚动/点击会明显发涩。"""
+        if self._scan_busy:
+            return                      # 上一轮还没扫完，这一拍跳过
+        self._scan_busy = True
+        threading.Thread(target=self._scan_then_apply, daemon=True).start()
+
+    def _scan_then_apply(self):
+        infos = None
+        try:
+            self.app.rescan_devices()
+            infos = list(self.app.all_infos())
+        except Exception:
+            log.debug("后台枚举设备失败", exc_info=True)
+        finally:
+            self._scan_busy = False
+        if infos is None:
+            return
+        try:
+            self.win.after(0, lambda: self._apply_infos(infos))
+        except Exception:
+            pass                        # 窗口已经关掉了，不用再刷
+
+    def _apply_infos(self, infos):
+        if not self.win.winfo_exists():
+            return
         sig = tuple(i.key for i in infos)
         if sig != self._list_sig:
             self._rebuild_rows(infos)
@@ -2219,8 +2324,17 @@ class SettingsDialog:
 
         want_auto = bool(self._vars["autostart"].get())
         if want_auto != bool(cfg.get("start_with_windows")):
+            old_auto = bool(cfg.get("start_with_windows"))
+            if not apply_autostart(want_auto):
+                # 注册表写不进去就别把配置改成 true，否则界面显示「已启用」、
+                # 实际上开机根本不会启动
+                self._vars["autostart"].set(old_auto)
+                show_error_dialog(
+                    self.win,
+                    "开机自启设置失败（系统拒绝了注册表写入）。\n"
+                    "本次设置未保存，请稍后重试。")
+                return
             cfg["start_with_windows"] = want_auto
-            apply_autostart(want_auto)
 
         settings = cfg.setdefault("device_settings", {})
         for k, v in self._vars.items():
@@ -2231,11 +2345,15 @@ class SettingsDialog:
             item["enabled"] = bool(v.get())
 
         if not save_config(cfg):
-            # 程序目录不可写（例如放在 Program Files）：明确告诉用户，别让它静默失败
+            # 程序目录不可写（例如放在 Program Files）：明确告诉用户，别让它静默失败。
+            # 窗口保持打开，让用户换目录/改权限后再点一次保存。
             show_error_dialog(
                 self.win,
                 "设置保存失败：程序目录可能没有写入权限。\n"
+                "本次改动已在当前运行中生效，但重启后会丢失。\n"
                 "请把程序放到用户目录或桌面后重试。")
+            log.warning("设置保存失败（运行中已生效，未持久化）：%s", CFG_PATH)
+            return
         self.app.on_config_changed()
         log.info("设置已保存: 阈值=%s%% 间隔=%ss 设备=%d 项",
                  cfg["low_threshold"], cfg["interval_sec"], len(settings))
@@ -2736,6 +2854,7 @@ class App:
         self.alert_sent = {}
         self.connect_sent = {}
         self.boot_time = time.time()
+        self.startup_reported = False   # 启动汇总是否已跑完（决定报警抑制是否结束）
         self.refresh_until = 0.0
         self._last_sig = None
         self._need_rescan = False    # 由 worker 置位，ui_loop 统一执行重建
@@ -2941,7 +3060,13 @@ class App:
                 self._need_rescan = True
                 log.info("[%s] 连续读取失败，触发设备表重新扫描", dev.name())
 
+        # 提交前最后确认一次：本轮 poll 可能刚跑了 1~2 秒，期间设备可能
+        # 被取消监视、或已被同 key 的新对象替换。旧对象的结果若照常写入，
+        # 会把新对象的读数覆盖掉，还会基于它弹出已经不该发的通知。
         with self.lock:
+            if dev.retired or not any(d is dev for d in self._devices):
+                log.info("[%s] 设备已被替换/取消监视，丢弃本次读数", dev.name())
+                return
             self.readings[dev.key] = rd
 
         if (prev.level != rd.level or prev.connected != rd.connected
@@ -3013,6 +3138,11 @@ class App:
             lines.append("共 %d 台设备" % len(items))
         return lines, len(items)
 
+    def _startup_notify_async(self):
+        """启动汇总丢到后台线程：里面有最多 3 次 sleep(1) 的等待重试，
+        在主线程（root.after 回调）里跑会把界面卡住三秒多。"""
+        threading.Thread(target=self._startup_notify, daemon=True).start()
+
     def _startup_notify(self):
         """手动启动时汇报一遍设备；有低电量就直接报警；自动启动时只在低电量时出声。"""
         if self.stop_evt.is_set():
@@ -3054,11 +3184,18 @@ class App:
             log.info("启动提示: %s", " / ".join(lines))
         except Exception:
             log.exception("启动提示失败")
+        finally:
+            # 汇总结束（成功、失败、提前返回都算）：之后拿到的读数不再被
+            # 启动窗口屏蔽，不会再出现「汇总里没有、报警也被跳过」的空档
+            self.startup_reported = True
 
     # --- 提醒 ---
     def _maybe_alert(self, dev: BaseDevice, rd: Reading):
-        # 启动初期的低电量统一由 _startup_notify 汇总，避免两条通知打架
-        if time.time() - self.boot_time < 6:
+        # 启动初期的低电量统一由 _startup_notify 汇总，避免两条通知打架。
+        # 只看「汇总是否已经跑完」而不是固定 6 秒：设备如果在汇总之后才读出
+        # 电量（开机自启时很常见），再卡一个 6 秒窗口就会把这条报警吞掉，
+        # 一等就是下一轮轮询（默认一分钟）。
+        if not self.startup_reported and time.time() - self.boot_time < 6:
             return
         if not rd.connected or rd.level is None or rd.wired:
             self.alert_sent.pop(dev.key, None)
@@ -3072,10 +3209,15 @@ class App:
             return
         if self.mute_alerts:
             return          # 临时停用：不发通知、也不记冷却，图标照旧闪烁
+        # 先发再记冷却：连 PowerShell 都起不来（或被拦）时不能吞掉这次
+        # 提醒机会——否则要白等一整个冷却周期才会再试
+        if not show_toast("%s 电量偏低" % dev.name(),
+                          "当前剩余 %d%%，请及时充电。" % rd.level,
+                          self.alert_png):
+            log.warning("低电量通知发送失败，下轮轮询再试: %s %d%%",
+                        dev.name(), rd.level)
+            return
         self.alert_sent[dev.key] = now
-        show_toast("%s 电量偏低" % dev.name(),
-                   "当前剩余 %d%%，请及时充电。" % rd.level,
-                   self.alert_png)
         log.info("已发送低电量通知: %s %d%%", dev.name(), rd.level)
 
     def check_threshold_now(self):
@@ -3421,10 +3563,20 @@ class App:
         return Menu(gen)
 
     def toggle_autostart(self, icon=None, item=None):
-        self.cfg["start_with_windows"] = not self.cfg.get("start_with_windows", False)
+        want = not self.cfg.get("start_with_windows", False)
+        if not apply_autostart(want):
+            # 注册表写不进去：配置保持原样，别让菜单打着勾却不会自启
+            try:
+                self.root.after(0, lambda: show_error_dialog(
+                    self.root,
+                    "开机自启设置失败（系统拒绝了注册表写入）。\n"
+                    "菜单状态保持原样，请稍后重试。"))
+            except Exception:
+                pass
+            return
+        self.cfg["start_with_windows"] = want
         if not save_config(self.cfg):
             self._warn_save_failed()
-        apply_autostart(self.cfg["start_with_windows"])
 
     def self_check(self, icon=None, item=None):
         def work():
@@ -3521,8 +3673,8 @@ class App:
 
         if "--settings" in sys.argv:
             self.root.after(300, self._show_settings)
-        # 等第一轮读数回来再汇报
-        self.root.after(3500, self._startup_notify)
+        # 等第一轮读数回来再汇报（放后台：里面可能要 sleep 等设备枚举出来）
+        self.root.after(3500, self._startup_notify_async)
 
         log.info("==== 启动 v%s ==== (autostart=%s)", APP_VERSION, self.autostart)
         self.root.mainloop()
@@ -3572,7 +3724,8 @@ class App:
 
 # ---------------------------------------------------------------- 自启动
 
-def apply_autostart(enable: bool):
+def apply_autostart(enable: bool) -> bool:
+    """写开机自启注册表；返回是否真的写成功（调用方据此决定要不要改配置）。"""
     try:
         import winreg
         key = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
@@ -3592,8 +3745,10 @@ def apply_autostart(enable: bool):
                 pass
         winreg.CloseKey(key)
         log.info("开机自启: %s", enable)
+        return True
     except Exception as e:
         log.warning("设置开机自启失败: %s", e)
+        return False
 
 
 # ---------------------------------------------------------------- 单实例
