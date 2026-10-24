@@ -52,14 +52,14 @@ jobs:
             echo "便携包解压即用，无需安装。"
             echo
             echo "> 本项目由 AI 制作，使用前请自行审阅代码。"
-          } > release-notes.md
+          } > fallback-notes.md
+          # 发布说明优先用仓库里的 RELEASE_NOTES.md（内容可控，也方便重跑时修正）
+          NOTES="RELEASE_NOTES.md"
+          [ -f "$NOTES" ] || NOTES="fallback-notes.md"
           if gh release view "$TAG" >/dev/null 2>&1; then
-            echo "Release 已存在，仅更新附件"
+            echo "Release 已存在：更新附件与发布说明"
             gh release upload "$TAG" "$PKG" --clobber
+            gh release edit "$TAG" --notes-file "$NOTES"
           else
-            # 优先用 annotated tag 的说明当作发布说明（即本版更新日志）；
-            # tag 没写说明时退回固定的兜底文案
-            gh release create "$TAG" "$PKG" --title "$TAG" --notes-from-tag \
-              || gh release create "$TAG" "$PKG" --title "$TAG" \
-                   --notes-file release-notes.md
+            gh release create "$TAG" "$PKG" --title "$TAG" --notes-file "$NOTES"
           fi
