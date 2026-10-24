@@ -57,9 +57,11 @@ jobs:
           NOTES="RELEASE_NOTES.md"
           [ -f "$NOTES" ] || NOTES="fallback-notes.md"
           if gh release view "$TAG" >/dev/null 2>&1; then
-            echo "Release 已存在：更新附件与发布说明"
+            echo "Release 已存在：更新附件与发布说明，并确保不是草稿"
             gh release upload "$TAG" "$PKG" --clobber
-            gh release edit "$TAG" --notes-file "$NOTES"
+            # --draft=false 是关键：tag 被删过/重建过时，原 release 会被
+            # 降级成草稿，只 edit 说明不会让它重新出现在 Releases 页面
+            gh release edit "$TAG" --draft=false --notes-file "$NOTES"
           else
             gh release create "$TAG" "$PKG" --title "$TAG" --notes-file "$NOTES"
           fi
