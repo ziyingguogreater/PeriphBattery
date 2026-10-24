@@ -57,5 +57,9 @@ jobs:
             echo "Release 已存在，仅更新附件"
             gh release upload "$TAG" "$PKG" --clobber
           else
-            gh release create "$TAG" "$PKG" --title "$TAG" --notes-file release-notes.md
+            # 优先用 annotated tag 的说明当作发布说明（即本版更新日志）；
+            # tag 没写说明时退回固定的兜底文案
+            gh release create "$TAG" "$PKG" --title "$TAG" --notes-from-tag \
+              || gh release create "$TAG" "$PKG" --title "$TAG" \
+                   --notes-file release-notes.md
           fi
