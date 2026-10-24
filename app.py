@@ -210,6 +210,10 @@ def load_config() -> dict:
         cfg["custom_threshold"] = 0      # 和预设重合就没必要单独留一项
     cfg["interval_sec"] = max(2, cfg["interval_sec"])
     cfg["alert_repeat_min"] = max(1, cfg["alert_repeat_min"])
+    # 顶层布尔同样要规范化：写成 "false" 时 bool("false") 是 True，
+    # 会把「关」变成「开」。两个字段的默认值不同，不能套同一个默认。
+    cfg["start_with_windows"] = _as_bool(cfg.get("start_with_windows"), False)
+    cfg["notify_on_connect"] = _as_bool(cfg.get("notify_on_connect"), True)
 
     # 结构校验：device_settings 被手改成列表、子项写成 null 时，
     # 后面 st.get() 会抛 AttributeError，而这条路径在启动建表时就跑，
@@ -526,7 +530,14 @@ def _strip_control(text: str) -> str:
     return "".join(ch for ch in text if ch in "\n\t" or ord(ch) >= 0x20)
 
 
-def show_toast(title: str, msg: str, icon_path: str, silent: bool = False) -> None:
+def show_toast(title: str, msg: str, icon_path: str, silent: bool = False,
+               on_done=None) -> bool:
+    """弹一条系统通知。
+
+    返回值只代表「PowerShell 进程是否起来了」；通知 API 到底有没有接受，
+    由 on_done(delivered: bool) 在后台线程回调告知。两者要分开对待：
+    调用方若在失败时仍记冷却，用户可能整轮都收不到任何提醒。
+    """
     title = _strip_control(title or "")
     msg = _strip_control(msg or "")
     # src 是 XML 属性值：路径里可能有 & " 等字符，必须转义；
@@ -586,22 +597,35 @@ def show_toast(title: str, msg: str, icon_path: str, silent: bool = False) -> No
             except Exception:
                 pass
         # 脚本会把结果写进 status 文件（OK / 异常类型+消息）：
-        # 只删不看等于白写，失败时至少要在日志里留下原因
+        # 只删不看等于白写，失败时至少要在日志里留下原因。
+        # 注意这里拿到的是「通知 API 是否接受」，不等于用户真看到了横幅。
+        delivered = False
         try:
             if os.path.exists(status):
                 with open(status, "r", encoding="utf-8-sig",
                           errors="replace") as f:
                     res = f.read().strip()
-                if res and res != "OK":
+                if res == "OK":
+                    delivered = True
+                elif res:
                     log.warning("通知未送达: %s（%s）", title, res)
+                else:
+                    log.warning("通知状态文件为空: %s", title)
+            else:
+                log.warning("通知未产生状态文件（进程可能异常退出）: %s", title)
         except Exception:
-            pass
+            log.debug("读取通知状态失败", exc_info=True)
         for f in (path, xml_path, status):
             try:
                 if os.path.exists(f):
                     os.remove(f)
             except Exception:
                 pass
+        if on_done is not None:
+            try:
+                on_done(delivered)
+            except Exception:
+                log.debug("通知完成回调异常", exc_info=True)
 
     threading.Thread(target=cleanup, daemon=True).start()
     return True
@@ -1532,7 +1556,11 @@ class ProfileDevice(BaseDevice):
                 # 0/0 且重试还是 0/0：接收器收不到设备，按未连接处理，
                 # 免得把「0%」当成真实电量去报警
                 return Reading(connected=False, error="设备可能已关机")
-            if zero:
+            # 0/0 只在「这份配置本来就声明过链路/供电语义」时才当成关机：
+            # wired_if / alive_if 已经把这类设备的 0/0 各自解释掉了，
+            # 这里只是兜住它们漏掉的边角。对于什么规则都没声明的自定义协议，
+            # 0% 是合法电量，硬判离线会把最该报的告警吞掉。
+            if zero and (p.alive_if or p.wired_if):
                 return Reading(connected=False, error="设备可能已关机")
             wired = charge in p.charge_on
             return Reading(connected=True, level=min(100, level),
@@ -2307,24 +2335,28 @@ class SettingsDialog:
         # 先校验可输入的字段，不合法就弹错误并把输入框还原，窗口保持开着
         if not self._validate_inputs():
             return
+        # 所有改动先写进候选副本：任一步失败就整份丢弃，
+        # 不会出现「阈值改了、自启没改成、取消后阈值却还在」的半吊子状态
         cfg = self.app.cfg
+        cand = json.loads(json.dumps(cfg))
         try:
-            cfg["low_threshold"] = max(1, min(99, int(self._threshold_value)))
+            cand["low_threshold"] = max(1, min(99, int(self._threshold_value)))
             cv = int(self._custom_value or 0)
-            cfg["custom_threshold"] = (
+            cand["custom_threshold"] = (
                 cv if (1 <= cv <= 99 and cv not in PRESET_THRESHOLDS) else 0)
-            cfg["alert_repeat_min"] = max(5, min(240, int(self._vars["repeat"].get())))
+            cand["alert_repeat_min"] = max(5, min(240, int(self._vars["repeat"].get())))
         except Exception as e:
             log.warning("保存阈值/间隔失败: %s", e)
         label = self._vars["interval"].get()
         for sec, text in self.INTERVALS:
             if text == label:
-                cfg["interval_sec"] = sec
-        cfg["notify_on_connect"] = bool(self._vars["notify"].get())
+                cand["interval_sec"] = sec
+        cand["notify_on_connect"] = bool(self._vars["notify"].get())
 
+        auto_changed = False
         want_auto = bool(self._vars["autostart"].get())
-        if want_auto != bool(cfg.get("start_with_windows")):
-            old_auto = bool(cfg.get("start_with_windows"))
+        if want_auto != bool(cand.get("start_with_windows")):
+            old_auto = bool(cand.get("start_with_windows"))
             if not apply_autostart(want_auto):
                 # 注册表写不进去就别把配置改成 true，否则界面显示「已启用」、
                 # 实际上开机根本不会启动
@@ -2334,9 +2366,10 @@ class SettingsDialog:
                     "开机自启设置失败（系统拒绝了注册表写入）。\n"
                     "本次设置未保存，请稍后重试。")
                 return
-            cfg["start_with_windows"] = want_auto
+            auto_changed = True
+            cand["start_with_windows"] = want_auto
 
-        settings = cfg.setdefault("device_settings", {})
+        settings = cand.setdefault("device_settings", {})
         for k, v in self._vars.items():
             if not k.startswith("dev:"):
                 continue
@@ -2344,19 +2377,26 @@ class SettingsDialog:
             item = settings.setdefault(key, {"enabled": True, "mode": "auto"})
             item["enabled"] = bool(v.get())
 
-        if not save_config(cfg):
+        if not save_config(cand):
             # 程序目录不可写（例如放在 Program Files）：明确告诉用户，别让它静默失败。
             # 窗口保持打开，让用户换目录/改权限后再点一次保存。
+            if auto_changed:
+                # 自启已经写进注册表了，配置却没落盘 → 把注册表退回去，
+                # 免得「配置文件说没开、注册表说开着」
+                apply_autostart(bool(cfg.get("start_with_windows")))
             show_error_dialog(
                 self.win,
                 "设置保存失败：程序目录可能没有写入权限。\n"
-                "本次改动已在当前运行中生效，但重启后会丢失。\n"
+                "本次改动未生效（重启后不会有任何变化）。\n"
                 "请把程序放到用户目录或桌面后重试。")
-            log.warning("设置保存失败（运行中已生效，未持久化）：%s", CFG_PATH)
+            log.warning("设置保存失败，改动已整体放弃：%s", CFG_PATH)
             return
+        # 落盘成功才提交到运行中的配置（原地更新，保持其它持有者的引用有效）
+        cfg.clear()
+        cfg.update(cand)
         self.app.on_config_changed()
         log.info("设置已保存: 阈值=%s%% 间隔=%ss 设备=%d 项",
-                 cfg["low_threshold"], cfg["interval_sec"], len(settings))
+                 cand["low_threshold"], cand["interval_sec"], len(settings))
         self.close()
 
     def cancel(self):
@@ -2978,16 +3018,24 @@ class App:
 
         keep = [d for d in self._devices if not d.retired]
         existing = {d.key: d for d in keep}
+        new_devs = []
+        restart = []
         for key, (info, mode) in wanted.items():
             dev = existing.get(key)
             if dev is not None:
+                # 同 key 且连接方式没变 → 直接复用旧对象，这里**不**核对路径。
+                # 同型号两台设备换插后 #n 序号可能互换、也可能指向另一个接口，
+                # 这是 README「已知限制」里同一处问题：要根治得用序列号 /
+                # Container ID 建立稳定身份，并把「物理设备」与「接口」分开。
+                # 在此之前宁可不猜——复用旧对象的 open() 会按 VID+PID+usage
+                # 重新定位，路径变了也能自愈。
                 if dev.force_mode == mode:
                     t = getattr(dev, "_thread", None)
                     if t is not None and not t.is_alive():
                         # 线程意外退出（异常、系统休眠等）→ 重新拉起，否则这台设备
                         # 会一直停在旧读数上，不会再刷新
                         log.warning("[%s] 轮询线程已退出，重新启动", dev.name())
-                        self._start_worker(dev)
+                        restart.append(dev)
                     continue
                 # 连接方式（auto/wired/wireless）只在构造时生效，
                 # 配置改了必须重建，否则旧对象还按老方式解析
@@ -2998,10 +3046,17 @@ class App:
                 log.info("[%s] 连接方式改为 %s，重建监视", dev.name(), mode)
             dev = make_device(info, mode)
             keep.append(dev)
-            self._start_worker(dev)
+            new_devs.append(dev)
             log.info("开始监视 %s (%s)", dev.name(), key)
         prev_count = len(self._devices)
+        # 必须先发布设备表、再启动线程：工作线程提交读数时要靠 _devices
+        # 判断自己是否仍然有效，先启动后发布会让跑得快的设备（例如蓝牙
+        # 命中缓存）在首轮就误判「已被替换」，读数和通知全被丢掉
         self._devices = keep
+        for dev in restart:
+            self._start_worker(dev)
+        for dev in new_devs:
+            self._start_worker(dev)
         if len(keep) != prev_count:
             self._refresh_menu()
 
@@ -3032,6 +3087,10 @@ class App:
         # 句柄由这里关：此时本线程不再读它，不会和别的线程抢同一个设备
         dev.close()
         log.info("[%s] 轮询线程退出", dev.name())
+
+    def _is_current(self, dev: BaseDevice) -> bool:
+        """dev 是否仍是当前有效的设备对象（未被取消监视、也没被替换）。"""
+        return (not dev.retired) and any(d is dev for d in self._devices)
 
     def _poll_once(self, dev: BaseDevice, evt: threading.Event):
         try:
@@ -3064,7 +3123,7 @@ class App:
         # 被取消监视、或已被同 key 的新对象替换。旧对象的结果若照常写入，
         # 会把新对象的读数覆盖掉，还会基于它弹出已经不该发的通知。
         with self.lock:
-            if dev.retired or not any(d is dev for d in self._devices):
+            if not self._is_current(dev):
                 log.info("[%s] 设备已被替换/取消监视，丢弃本次读数", dev.name())
                 return
             self.readings[dev.key] = rd
@@ -3073,6 +3132,15 @@ class App:
                 or prev.wired != rd.wired):
             log.info("[%s] conn=%s wired=%s level=%s charge=%s %s",
                      dev.name(), rd.connected, rd.wired, rd.level, rd.charging, rd.error)
+
+        # 通知在锁外发出（要起子进程，不能占着锁）。这里的复检只能把
+        # 「检查到发通知之间」的窗口缩到几行，并不能彻底消除：真要完全
+        # 消除，得让通知也持有 generation token 并接受「发出去后才发现
+        # 已退役」的可能。取舍：那需要把通知调度整体改成可取消队列，
+        # 而实际收益只是少弹一条几秒内会过期的提示，不值得这个复杂度。
+        if not self._is_current(dev):
+            log.info("[%s] 设备已退役，跳过本次通知", dev.name())
+            return
 
         if rd.connected and not prev.connected:
             self._on_connected(dev, rd)
@@ -3161,15 +3229,23 @@ class App:
                 self.rebuild_devices()
             low_lines, low_count = self._device_summary_lines(only_low=True)
             if low_count and not self.mute_alerts:
-                show_toast("电量偏低，请及时充电", "\n".join(low_lines), self.alert_png)
                 now = time.time()
                 rs = self.snapshot()
                 threshold = int(self.cfg.get("low_threshold", 20))
+                low_keys = []
                 for d in list(self._devices):
                     r = rs.get(d.key)
                     if (r and r.connected and not r.wired
                             and r.level is not None and r.level <= threshold):
                         self.alert_sent[d.key] = now
+                        low_keys.append(d.key)
+                ok = show_toast(
+                    "电量偏低，请及时充电", "\n".join(low_lines), self.alert_png,
+                    on_done=lambda done, ks=list(low_keys): self._on_alert_result(ks, done))
+                if not ok:
+                    # 连 PowerShell 都没起来：这些设备的冷却立刻撤销
+                    self._revoke_alerts(low_keys)
+                    log.warning("启动提示发送失败，未占用冷却")
                 log.info("启动时发现 %d 台低电量设备，已提示", low_count)
                 return
 
@@ -3209,16 +3285,36 @@ class App:
             return
         if self.mute_alerts:
             return          # 临时停用：不发通知、也不记冷却，图标照旧闪烁
-        # 先发再记冷却：连 PowerShell 都起不来（或被拦）时不能吞掉这次
-        # 提醒机会——否则要白等一整个冷却周期才会再试
-        if not show_toast("%s 电量偏低" % dev.name(),
-                          "当前剩余 %d%%，请及时充电。" % rd.level,
-                          self.alert_png):
+        # 先占位再发：避免同一轮里重复弹。发送失败要撤销占位，
+        # 否则一次失败就要白等一整个冷却周期才会重试。
+        # 这里分两级：Popen 起不来是即时失败，通知 API 拒绝是异步回调。
+        self.alert_sent[dev.key] = now
+        ok = show_toast(
+            "%s 电量偏低" % dev.name(),
+            "当前剩余 %d%%，请及时充电。" % rd.level,
+            self.alert_png,
+            on_done=lambda done, k=dev.key: self._on_alert_result([k], done))
+        if not ok:
+            self.alert_sent.pop(dev.key, None)
             log.warning("低电量通知发送失败，下轮轮询再试: %s %d%%",
                         dev.name(), rd.level)
             return
-        self.alert_sent[dev.key] = now
-        log.info("已发送低电量通知: %s %d%%", dev.name(), rd.level)
+        log.info("已发起低电量通知: %s %d%%", dev.name(), rd.level)
+
+    def _revoke_alerts(self, keys):
+        for k in keys:
+            self.alert_sent.pop(k, None)
+
+    def _on_alert_result(self, keys, delivered: bool):
+        """通知 API 的最终结果（后台线程回调）。
+
+        show_toast 返回 True 只说明 PowerShell 起来了；这里才是
+        「通知有没有被系统接受」。没送到就撤销冷却，让下一轮立刻重试。"""
+        if delivered:
+            return
+        self._revoke_alerts(keys)
+        log.warning("低电量通知未送达，已撤销冷却，下轮重试: %s",
+                    "、".join(keys) or "-")
 
     def check_threshold_now(self):
         """阈值改了：立刻按新阈值评估一遍，已经低于阈值的马上提醒。"""
