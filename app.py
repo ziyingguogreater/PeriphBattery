@@ -1420,21 +1420,29 @@ class BaseDevice:
 
         # 路径失效（换 USB 口）时重新枚举一次。必须连 PID 一起比对：
         # 同一厂商的两款设备可能共用 usage_page/usage，只按 VID 找会打开
-        # 另一台设备，然后把本配置的指令发过去
-        for d in hid.enumerate(self.info.vid):
-            if int(d.get("product_id") or 0) != self.info.pid:
+        # 另一台设备，然后把本配置的指令发过去。
+        cands = [d for d in hid.enumerate(self.info.vid)
+                 if int(d.get("product_id") or 0) == self.info.pid
+                 and d.get("usage_page") == self.info.usage_page
+                 and d.get("usage") == self.info.usage]
+        if len(cands) > 1:
+            # 同型号两台都插着：VID/PID/用法完全一样，没法判断哪一台才是
+            # 原来那个。随便打开一个就等于把指令发给另一台设备（串台），
+            # 宁可报未连接——连续失败会触发重建，届时按新枚举结果建对象。
+            log.warning("[%s] 找到 %d 个同型号接口，无法唯一定位，暂不重连",
+                        self.key, len(cands))
+            return False
+        for d in cands:
+            try:
+                dev = hid.device()
+                dev.open_path(d["path"])
+                dev.set_nonblocking(1)
+                self.dev = dev
+                self.info.path = d["path"]
+                log.info("[%s] 重新定位接口成功", self.key)
+                return True
+            except Exception:
                 continue
-            if d.get("usage_page") == self.info.usage_page and d.get("usage") == self.info.usage:
-                try:
-                    dev = hid.device()
-                    dev.open_path(d["path"])
-                    dev.set_nonblocking(1)
-                    self.dev = dev
-                    self.info.path = d["path"]
-                    log.info("[%s] 重新定位接口成功", self.key)
-                    return True
-                except Exception:
-                    continue
         return False
 
     def close(self):
@@ -1536,7 +1544,6 @@ class ProfileDevice(BaseDevice):
                 return Reading(connected=False, error="设备可能已关机")
 
             level, charge = int(r[p.level_index]), int(r[p.charge_index])
-            zero = (level == 0 and charge == 0)
             if p.wired_if and self._wired_hit(level, charge):
                 wired_only = (not p.wired_pids) or (self.info.pid in p.wired_pids)
                 if wired_only:
@@ -1553,15 +1560,12 @@ class ProfileDevice(BaseDevice):
                         wired = ch in p.charge_on
                         return Reading(connected=True, level=min(100, lv),
                                        charging=wired, wired=wired)
-                # 0/0 且重试还是 0/0：接收器收不到设备，按未连接处理，
-                # 免得把「0%」当成真实电量去报警
+                # wired_if 命中、重试还是命中：配置已经声明「这种回包就是
+                # 没有可读电量」，按未连接处理
                 return Reading(connected=False, error="设备可能已关机")
-            # 0/0 只在「这份配置本来就声明过链路/供电语义」时才当成关机：
-            # wired_if / alive_if 已经把这类设备的 0/0 各自解释掉了，
-            # 这里只是兜住它们漏掉的边角。对于什么规则都没声明的自定义协议，
-            # 0% 是合法电量，硬判离线会把最该报的告警吞掉。
-            if zero and (p.alive_if or p.wired_if):
-                return Reading(connected=False, error="设备可能已关机")
+            # 到这里说明：存活标志（如果配了）已经通过、也没命中 wired_if。
+            # 此时 0% 就是真实的 0%——不能再拿「有没有配 alive_if」去推断
+            # 0/0 等于关机，那会把最该报的低电量吞成「未连接」。
             wired = charge in p.charge_on
             return Reading(connected=True, level=min(100, level),
                            charging=wired, wired=wired)
@@ -2892,6 +2896,9 @@ class App:
         self.stop_evt = threading.Event()
 
         self.alert_sent = {}
+        # key -> 本次发送的令牌：只在「这条回调对应的仍是当前那次发送」时
+        # 才允许撤销冷却，否则旧通知的失败结果会删掉新通知刚记的冷却
+        self._alert_attempts = {}
         self.connect_sent = {}
         self.boot_time = time.time()
         self.startup_reported = False   # 启动汇总是否已跑完（决定报警抑制是否结束）
@@ -3173,9 +3180,14 @@ class App:
             log.debug("重建托盘菜单失败", exc_info=True)
 
     # --- 启动提示 ---
-    def _device_summary_lines(self, only_low: bool = False, devices=None):
-        """按电量从低到高排，有线/未知电量排最后；超过上限折叠成一行。"""
-        rs = self.snapshot()
+    def _device_summary_lines(self, only_low: bool = False, devices=None,
+                              rs=None):
+        """按电量从低到高排，有线/未知电量排最后；超过上限折叠成一行。
+
+        rs 可以传入调用方已经取好的读数快照：通知正文和随后的冷却记录
+        必须基于同一份数据，否则两次快照之间新出现的设备会「被记冷却
+        却没出现在通知里」。"""
+        rs = self.snapshot() if rs is None else rs
         threshold = int(self.cfg.get("low_threshold", 20))
         items = []
         for d in (self._devices if devices is None else devices):
@@ -3227,24 +3239,36 @@ class App:
                     break
                 time.sleep(1.0)
                 self.rebuild_devices()
-            low_lines, low_count = self._device_summary_lines(only_low=True)
+            # 只取一次快照：通知正文、数量、要记冷却的设备全都基于同一份数据。
+            # 之前「先算正文、再取一次快照定 key」会在两次快照之间漏进新读数，
+            # 导致某台设备没出现在通知里、却被记了冷却。
+            devices = list(self._devices)
+            rs = self.snapshot()
+            threshold = int(self.cfg.get("low_threshold", 20))
+            low_items = []
+            for d in devices:
+                r = rs.get(d.key)
+                if (r and r.connected and not r.wired
+                        and r.level is not None and r.level <= threshold):
+                    low_items.append((d, r))
+            low_count = len(low_items)
             if low_count and not self.mute_alerts:
+                low_lines, _ = self._device_summary_lines(
+                    only_low=True, devices=[d for d, _ in low_items], rs=rs)
                 now = time.time()
-                rs = self.snapshot()
-                threshold = int(self.cfg.get("low_threshold", 20))
-                low_keys = []
-                for d in list(self._devices):
-                    r = rs.get(d.key)
-                    if (r and r.connected and not r.wired
-                            and r.level is not None and r.level <= threshold):
-                        self.alert_sent[d.key] = now
-                        low_keys.append(d.key)
+                low_keys = [d.key for d, _ in low_items]
+                attempt = object()
+                with self.lock:
+                    for k in low_keys:
+                        self.alert_sent[k] = now
+                        self._alert_attempts[k] = attempt
                 ok = show_toast(
                     "电量偏低，请及时充电", "\n".join(low_lines), self.alert_png,
-                    on_done=lambda done, ks=list(low_keys): self._on_alert_result(ks, done))
+                    on_done=lambda done, ks=list(low_keys), at=attempt:
+                    self._on_alert_result(ks, done, at))
                 if not ok:
                     # 连 PowerShell 都没起来：这些设备的冷却立刻撤销
-                    self._revoke_alerts(low_keys)
+                    self._revoke_alerts(low_keys, attempt)
                     log.warning("启动提示发送失败，未占用冷却")
                 log.info("启动时发现 %d 台低电量设备，已提示", low_count)
                 return
@@ -3274,51 +3298,70 @@ class App:
         if not self.startup_reported and time.time() - self.boot_time < 6:
             return
         if not rd.connected or rd.level is None or rd.wired:
-            self.alert_sent.pop(dev.key, None)
+            with self.lock:
+                self.alert_sent.pop(dev.key, None)
+                self._alert_attempts.pop(dev.key, None)
             return
         threshold = int(self.cfg.get("low_threshold", 20))
         if rd.level > threshold:
-            self.alert_sent.pop(dev.key, None)
+            with self.lock:
+                self.alert_sent.pop(dev.key, None)
+                self._alert_attempts.pop(dev.key, None)
             return
         now = time.time()
-        if now - self.alert_sent.get(dev.key, 0) < self.cfg.get("alert_repeat_min", 30) * 60:
-            return
+        repeat = self.cfg.get("alert_repeat_min", 30) * 60
         if self.mute_alerts:
             return          # 临时停用：不发通知、也不记冷却，图标照旧闪烁
-        # 先占位再发：避免同一轮里重复弹。发送失败要撤销占位，
-        # 否则一次失败就要白等一整个冷却周期才会重试。
-        # 这里分两级：Popen 起不来是即时失败，通知 API 拒绝是异步回调。
-        self.alert_sent[dev.key] = now
+        # 检查、占位、令牌登记放在同一把锁里：并发调用方（轮询线程、改阈值
+        # 后的立即评估）不会同时通过检查而重复弹窗。
+        with self.lock:
+            if now - self.alert_sent.get(dev.key, 0) < repeat:
+                return
+            # 先占位再发：避免同一轮里重复弹。发送失败要撤销占位，
+            # 否则一次失败就要白等一整个冷却周期才会重试。
+            # 分两级：Popen 起不来是即时失败，通知 API 拒绝是异步回调。
+            self.alert_sent[dev.key] = now
+            attempt = object()
+            self._alert_attempts[dev.key] = attempt
         ok = show_toast(
             "%s 电量偏低" % dev.name(),
             "当前剩余 %d%%，请及时充电。" % rd.level,
             self.alert_png,
-            on_done=lambda done, k=dev.key: self._on_alert_result([k], done))
+            on_done=lambda done, k=dev.key, at=attempt:
+            self._on_alert_result([k], done, at))
         if not ok:
-            self.alert_sent.pop(dev.key, None)
+            self._revoke_alerts([dev.key], attempt)
             log.warning("低电量通知发送失败，下轮轮询再试: %s %d%%",
                         dev.name(), rd.level)
             return
         log.info("已发起低电量通知: %s %d%%", dev.name(), rd.level)
 
-    def _revoke_alerts(self, keys):
-        for k in keys:
-            self.alert_sent.pop(k, None)
+    def _revoke_alerts(self, keys, attempt=None):
+        """撤销冷却。给了 attempt 时只在「仍是当前那次发送」时生效，
+        避免旧通知的迟到失败把新通知刚记的冷却删掉。"""
+        with self.lock:
+            for k in keys:
+                if attempt is not None and self._alert_attempts.get(k) is not attempt:
+                    continue        # 这条结果属于更早的一次发送，忽略
+                self.alert_sent.pop(k, None)
+                self._alert_attempts.pop(k, None)
 
-    def _on_alert_result(self, keys, delivered: bool):
+    def _on_alert_result(self, keys, delivered: bool, attempt=None):
         """通知 API 的最终结果（后台线程回调）。
 
         show_toast 返回 True 只说明 PowerShell 起来了；这里才是
         「通知有没有被系统接受」。没送到就撤销冷却，让下一轮立刻重试。"""
         if delivered:
             return
-        self._revoke_alerts(keys)
+        self._revoke_alerts(keys, attempt)
         log.warning("低电量通知未送达，已撤销冷却，下轮重试: %s",
                     "、".join(keys) or "-")
 
     def check_threshold_now(self):
         """阈值改了：立刻按新阈值评估一遍，已经低于阈值的马上提醒。"""
-        self.alert_sent.clear()
+        with self.lock:
+            self.alert_sent.clear()
+            self._alert_attempts.clear()   # 旧发送的回调就此失效，不会误删新冷却
         rs = self.snapshot()
         for d in list(self._devices):
             rd = rs.get(d.key)
