@@ -76,7 +76,10 @@ pyinstaller --noconfirm PeriphBattery.spec
 - `request.payload`：发的原始报文（十六进制）
 - `level_index` / `charge_index`：回包里电量与充电状态的位置
 - 可选：`wired_if`（哪种回包代表纯供电）、`wired_pids`（只有这些 PID 才算纯供电）、
-  `alive_if`（哪个字节等于什么值才算设备在线，用于识别「接收器在、设备关机」）
+  `alive_if`（哪个字节等于什么值才算设备在线）、`offline_if`（哪个字节等于什么值才判定
+  设备已关机）。后两个都用于识别「接收器在、设备关机」，**只能配一个**：
+  状态字节只有一两种在线取值时用 `alive_if`；有线/无线/充电时取值各不相同、
+  只有关机复述那一种特殊时用 `offline_if`
 
 **不想自己抓协议？** 仓库里带了一份写给 AI 的提示词
 [AI提示词-生成设备配置.md](AI提示词-生成设备配置.md)（便携包里也有）。

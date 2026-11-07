@@ -1106,6 +1106,11 @@ class Profile:
     alive_if: tuple         # (下标, 值)：回包该字节不等于此值就判定设备已关机
     read_timeout: float
     file: str
+    # (下标, 值)：回包该字节等于此值才判定设备已关机。
+    # 与 alive_if 的区别：alive_if 是白名单（链路状态字节只有一两种取值时用），
+    # offline_if 是黑名单（同一个字节在有线/无线/电量变化时取值很多，
+    # 只有「接收器复述缓存」那一种要判离线时用）。两者互斥。
+    offline_if: tuple = ()
 
     def match_text(self) -> str:
         ids = "/".join("%04X" % p for p in self.pids) if self.pids else "任意"
@@ -1223,6 +1228,24 @@ def load_profile(path: str) -> Profile:
         alive_if = (idx, val)
     else:
         raise ValueError("response.alive_if 必须是对象")
+
+    oi = rs.get("offline_if")
+    if oi is None:
+        offline_if = ()
+    elif isinstance(oi, dict):
+        if ai is not None:
+            raise ValueError("response.alive_if 与 offline_if 只能配一个")
+        idx = oi.get("index")
+        if not isinstance(idx, int) or isinstance(idx, bool) or not 0 <= idx <= 63:
+            raise ValueError("response.offline_if.index 必须是 0~63 的整数")
+        val = _hex_int(oi.get("value"))
+        if not 0 <= val <= 255:
+            raise ValueError("response.offline_if.value 必须在 00~FF 之间")
+        if idx >= length:
+            raise ValueError("response.offline_if.index 必须小于 request.length（%d）" % length)
+        offline_if = (idx, val)
+    else:
+        raise ValueError("response.offline_if 必须是对象")
     try:
         timeout = float(rs.get("timeout", 1.2))
     except Exception:
@@ -1236,7 +1259,8 @@ def load_profile(path: str) -> Profile:
                    level_index=level_index, charge_index=charge_index,
                    charge_on=tuple(charge_on), wired_if=dict(wired_if),
                    wired_pids=wired_pids, alive_if=alive_if,
-                   read_timeout=timeout, file=os.path.basename(path))
+                   read_timeout=timeout, file=os.path.basename(path),
+                   offline_if=offline_if)
 
 
 PROFILES = []          # 已加载的配置（按文件名排序）
@@ -1517,13 +1541,23 @@ class ProfileDevice(BaseDevice):
         return True
 
     def _alive(self, r) -> bool:
-        """回包的链路状态字节是否符合配置；没配 alive_if 就一律算活着。
+        """回包是否表示设备在线。
+
+        - offline_if（黑名单）：该字节等于给定值才判离线。适合「有线/无线/
+          放电时这个字节取值很多，只有接收器复述缓存那一种要判掉」的设备。
+        - alive_if（白名单）：该字节必须等于给定值才算在线。适合状态字节只有
+          一两种取值的设备。
+        - 都没配：一律算在线。
 
         首次回包和「疑似纯供电」的重试回包都要过这一关：接收器在设备
         关机时会把上一包缓存复述回来，只校验首包会漏掉重试包。"""
-        if not self.p.alive_if:
+        p = self.p
+        if p.offline_if:
+            idx, val = p.offline_if
+            return not (len(r) > idx and int(r[idx]) == val)
+        if not p.alive_if:
             return True
-        idx, want = self.p.alive_if
+        idx, want = p.alive_if
         return len(r) > idx and int(r[idx]) == want
 
     def poll(self) -> Reading:

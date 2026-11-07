@@ -14,9 +14,9 @@
     "expect": "AA 30",
     "level_index": 8,
     "charge_index": 9,
-    "alive_if": {
+    "offline_if": {
       "index": 3,
-      "value": "0B"
+      "value": "5D"
     }
   }
 }
